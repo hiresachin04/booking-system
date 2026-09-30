@@ -122,9 +122,9 @@ public final class BookingService {
             try {
                 payments.capture(authorizationId);
             } catch (RuntimeException captureFailure) {
-                booking.markPaymentPending(authorizationId);
+                booking.markPaymentPending(authorizationId, clock.instant());
                 try {
-                    settlePendingPayment(booking, inventory);
+                    settlePayment(booking, inventory);
                 } catch (RuntimeException settleFailure) {
                     captureFailure.addSuppressed(settleFailure);
                     throw new PaymentPendingException(booking.id(), captureFailure);
@@ -159,7 +159,7 @@ public final class BookingService {
             long refund = refundPolicy.refundPaise(booking.price().totalPaise(), Duration.between(now, booking.show().startsAt()));
             String paymentId = booking.paymentId().orElseThrow(() -> new IllegalStateException("confirmed booking " + bookingId + " has no payment"));
             // Refund first: if the gateway fails, the booking and its seats are untouched and the cancel can be retried.
-            if (refund > 0) payments.refund(paymentId, refund);
+            if (refund > 0) payments.refund(booking.id() + ":cancel", paymentId, refund);
             inventory.cancel(booking.id(), booking.seatIds());
             booking.markCancelled(refund);
             outbox.publish(BookingEventType.CANCELLED, booking);
@@ -178,44 +178,77 @@ public final class BookingService {
 
     /**
      * Retries every booking whose capture outcome is still unknown. Meant to run on a schedule, so it reports
-     * failures instead of throwing them: an exception escaping a scheduled task cancels every later run. A booking
-     * that can't be settled yet stays PAYMENT_PENDING and is retried on the next run.
+     * failures instead of throwing them: an exception escaping a scheduled task cancels every later run.
+     * A PAYMENT_PENDING booking still unsettled at its deadline (see {@link BookingConfig#maxPaymentPending()},
+     * or show start if sooner) gives its seats back for resale and becomes PAYMENT_UNRESOLVED; its payment keeps
+     * being reconciled, and is refunded in full if it turns out to have been captured.
      */
     public ReconciliationReport reconcilePendingPayments() {
+        List<Booking> open = new ArrayList<>(bookings.findByStatus(BookingStatus.PAYMENT_PENDING));
+        open.addAll(bookings.findByStatus(BookingStatus.PAYMENT_UNRESOLVED));
         List<String> settled = new ArrayList<>();
+        List<String> seatsReleased = new ArrayList<>();
         List<ReconciliationReport.Failure> failures = new ArrayList<>();
-        for (Booking booking : bookings.findByStatus(BookingStatus.PAYMENT_PENDING)) {
+        for (Booking booking : open) {
             ShowInventory inventory = inventoryOf(booking.show().id());
             synchronized (booking) {
-                if (booking.status() != BookingStatus.PAYMENT_PENDING) continue;
+                BookingStatus before = booking.status();
+                if (before != BookingStatus.PAYMENT_PENDING && before != BookingStatus.PAYMENT_UNRESOLVED) continue;
                 try {
-                    settlePendingPayment(booking, inventory);
+                    settlePayment(booking, inventory);
+                    // The customer was told the payment was pending, so every outcome reached here is news to them.
+                    switch (booking.status()) {
+                        case CONFIRMED -> outbox.publish(BookingEventType.CONFIRMED, booking);
+                        case PAYMENT_FAILED -> outbox.publish(BookingEventType.PAYMENT_FAILED, booking);
+                        case PAYMENT_REFUNDED -> outbox.publish(BookingEventType.PAYMENT_REFUNDED, booking);
+                        default -> throw new IllegalStateException("settled booking " + booking.id() + " left in " + booking.status());
+                    }
+                    settled.add(booking.id());
                 } catch (RuntimeException e) {
                     failures.add(new ReconciliationReport.Failure(booking.id(), e));
-                    continue;
                 }
-                settled.add(booking.id());
-                if (booking.status() == BookingStatus.CONFIRMED) outbox.publish(BookingEventType.CONFIRMED, booking);
+                if (booking.status() == BookingStatus.PAYMENT_PENDING && !clock.instant().isBefore(pendingDeadline(booking))) {
+                    inventory.cancel(booking.id(), booking.seatIds());
+                    booking.markPaymentUnresolved();
+                    seatsReleased.add(booking.id());
+                }
             }
         }
-        return new ReconciliationReport(settled, failures);
+        return new ReconciliationReport(settled, seatsReleased, failures);
+    }
+
+    private Instant pendingDeadline(Booking booking) {
+        Instant timeout = booking.paymentPendingSince().plus(config.maxPaymentPending());
+        Instant showStart = booking.show().startsAt();
+        return timeout.isBefore(showStart) ? timeout : showStart;
     }
 
     /**
-     * Lets the processor's record decide a PAYMENT_PENDING booking. Seats are freed only once the processor says
-     * the money can no longer be taken; if it can't be reached, or the void fails, this throws and nothing changes.
+     * Lets the processor's record decide a booking whose capture outcome was unknown. While the booking still
+     * holds its seats (PAYMENT_PENDING), they are freed only once the processor says the money can no longer be
+     * taken. If it can't be reached, or a void or refund fails, this throws and the booking is left as it was.
      */
-    private void settlePendingPayment(Booking booking, ShowInventory inventory) {
+    private void settlePayment(Booking booking, ShowInventory inventory) {
         String authorizationId = booking.paymentId().orElseThrow();
+        boolean holdsSeats = booking.status() == BookingStatus.PAYMENT_PENDING;
         PaymentStatus status = payments.status(authorizationId);
         if (status == PaymentStatus.AUTHORIZED) {
             payments.voidAuthorization(authorizationId);
             status = PaymentStatus.VOIDED;
         }
         switch (status) {
-            case CAPTURED -> booking.markConfirmed(authorizationId);
+            case CAPTURED -> {
+                if (holdsSeats) {
+                    booking.markConfirmed(authorizationId);
+                } else {
+                    long paid = booking.price().totalPaise();
+                    payments.refund(booking.id() + ":unresolved", authorizationId, paid);
+                    booking.discountCode().ifPresent(DiscountCode::releaseUse);
+                    booking.markPaymentRefunded(paid);
+                }
+            }
             case VOIDED -> {
-                inventory.cancel(booking.id(), booking.seatIds());
+                if (holdsSeats) inventory.cancel(booking.id(), booking.seatIds());
                 booking.discountCode().ifPresent(DiscountCode::releaseUse);
                 booking.markPaymentFailed();
             }

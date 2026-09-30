@@ -40,6 +40,7 @@ class BookingServiceTest {
     private static final Instant WEEKDAY_SHOW = NOW.plus(Duration.ofHours(8));
     private static final Duration TTL = Duration.ofMinutes(10);
     private static final int MAX_SEATS = 10;
+    private static final Duration MAX_PENDING = Duration.ofMinutes(15);
 
     private final MutableClock clock = new MutableClock(NOW);
     private final ShowRepository shows = new ShowRepository(clock);
@@ -65,11 +66,21 @@ class BookingServiceTest {
         public void onCancelled(Booking booking) {
             events.add("cancelled " + booking.id());
         }
+
+        @Override
+        public void onPaymentFailed(Booking booking) {
+            events.add("payment failed " + booking.id());
+        }
+
+        @Override
+        public void onPaymentRefunded(Booking booking) {
+            events.add("refunded " + booking.id());
+        }
     };
 
     private BookingService service(NotificationOutbox outbox) {
         return new BookingService(shows, bookings, discounts, payments, refundPolicy,
-                new BookingConfig(TTL, MAX_SEATS, 1_000), clock, outbox);
+                new BookingConfig(TTL, MAX_SEATS, 1_000, MAX_PENDING), clock, outbox);
     }
 
     private final NotificationOutbox outbox = new NotificationOutbox(List.of(recorder), new RetryPolicy(3, Duration.ofSeconds(30)), clock);
@@ -269,7 +280,7 @@ class BookingServiceTest {
         assertEquals(PaymentStatus.VOIDED, payments.state("auth_1"));
         assertEquals(SeatStatus.AVAILABLE, inventory.status("A1"));
         assertEquals(0, dc.used());
-        assertEquals(List.of(), deliveredEvents());
+        assertEquals(List.of("payment failed " + booking.id()), deliveredEvents());
     }
 
     @Test
@@ -324,6 +335,122 @@ class BookingServiceTest {
         assertEquals(1, report.settledBookingIds().size());
         assertEquals(1, bookings.findByStatus(BookingStatus.PAYMENT_PENDING).size());
         assertEquals(1, bookings.findByStatus(BookingStatus.CONFIRMED).size());
+    }
+
+    /** Leaves the booking PAYMENT_PENDING with the processor unreachable for {@code lookupFailures} status checks. */
+    private Booking pendingBooking(User user, String showId, String seat, int lookupFailures, boolean processorCaptured) {
+        Booking booking = service.holdSeats(user, showId, List.of(seat));
+        if (processorCaptured) payments.loseNextCaptureResponse(new RuntimeException("read timeout"));
+        else payments.failNextCapture(new RuntimeException("connection reset"));
+        payments.failStatusLookups(lookupFailures);
+        assertThrows(PaymentPendingException.class, () -> service.confirm(user, booking.id()));
+        return booking;
+    }
+
+    @Test
+    void keepsPendingSeatsBlockedUntilTheDeadline() {
+        Booking booking = pendingBooking(alice, "sh", "A1", 100, true);
+        clock.advance(MAX_PENDING.minusNanos(1));
+
+        ReconciliationReport report = service.reconcilePendingPayments();
+
+        assertEquals(List.of(), report.seatsReleasedBookingIds());
+        assertEquals(BookingStatus.PAYMENT_PENDING, booking.status());
+        assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
+    }
+
+    @Test
+    void releasesPendingSeatsForResaleAtTheDeadline() {
+        Booking booking = pendingBooking(alice, "sh", "A1", 100, true);
+        clock.advance(MAX_PENDING);
+
+        ReconciliationReport report = service.reconcilePendingPayments();
+
+        assertEquals(List.of(booking.id()), report.seatsReleasedBookingIds());
+        assertEquals(BookingStatus.PAYMENT_UNRESOLVED, booking.status());
+        assertEquals(SeatStatus.AVAILABLE, inventory.status("A1"));
+        service.holdSeats(bob, "sh", List.of("A1"));
+    }
+
+    @Test
+    void releasesPendingSeatsAtShowStartWhenThatComesBeforeTheDeadline() {
+        Instant soon = NOW.plus(Duration.ofMinutes(12));
+        shows.add(Fixtures.show("soon", soon));
+        Booking booking = pendingBooking(alice, "soon", "A1", 100, true);
+        clock.set(soon);
+
+        service.reconcilePendingPayments();
+
+        assertEquals(BookingStatus.PAYMENT_UNRESOLVED, booking.status());
+    }
+
+    @Test
+    void refundsInFullWhenAnUnresolvedPaymentTurnsOutCaptured() {
+        DiscountCode dc = code("ONE", new Discount.Flat(5_000), 0, 1);
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"), "ONE");
+        payments.loseNextCaptureResponse(new RuntimeException("read timeout"));
+        payments.failStatusLookups(2);
+        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
+        clock.advance(MAX_PENDING);
+        service.reconcilePendingPayments();
+        service.holdSeats(bob, "sh", List.of("A1"));
+
+        ReconciliationReport report = service.reconcilePendingPayments();
+
+        assertEquals(List.of(booking.id()), report.settledBookingIds());
+        assertEquals(BookingStatus.PAYMENT_REFUNDED, booking.status());
+        assertEquals(List.of(new FakePaymentGateway.Refund("auth_1", 15_000)), payments.refunds());
+        assertEquals(15_000, booking.refundedPaise());
+        assertEquals(0, dc.used());
+        assertEquals(SeatStatus.HELD, inventory.status("A1"));
+        assertEquals(List.of("refunded " + booking.id()), deliveredEvents());
+    }
+
+    @Test
+    void voidsAnUnresolvedPaymentThatWasNeverCapturedWithoutTouchingResoldSeats() {
+        Booking booking = pendingBooking(alice, "sh", "A1", 2, false);
+        clock.advance(MAX_PENDING);
+        service.reconcilePendingPayments();
+        Booking resold = service.holdSeats(bob, "sh", List.of("A1"));
+
+        service.reconcilePendingPayments();
+
+        assertEquals(BookingStatus.PAYMENT_FAILED, booking.status());
+        assertEquals(PaymentStatus.VOIDED, payments.state("auth_1"));
+        assertEquals(List.of(), payments.refunds());
+        service.confirm(bob, resold.id());
+        assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
+    }
+
+    @Test
+    void retriesAFailedAutoRefundOnTheNextRun() {
+        Booking booking = pendingBooking(alice, "sh", "A1", 2, true);
+        clock.advance(MAX_PENDING);
+        service.reconcilePendingPayments();
+        payments.failNextRefund(new RuntimeException("refund api down"));
+
+        ReconciliationReport failed = service.reconcilePendingPayments();
+        assertEquals(1, failed.failures().size());
+        assertEquals(BookingStatus.PAYMENT_UNRESOLVED, booking.status());
+
+        service.reconcilePendingPayments();
+        assertEquals(BookingStatus.PAYMENT_REFUNDED, booking.status());
+        assertEquals(1, payments.refunds().size());
+    }
+
+    @Test
+    void retryingARefundWhoseResponseWasLostDoesNotRefundTwice() {
+        Booking booking = pendingBooking(alice, "sh", "A1", 2, true);
+        clock.advance(MAX_PENDING);
+        service.reconcilePendingPayments();
+        payments.loseNextRefundResponse(new RuntimeException("read timeout"));
+
+        service.reconcilePendingPayments();
+        assertEquals(BookingStatus.PAYMENT_UNRESOLVED, booking.status());
+        service.reconcilePendingPayments();
+
+        assertEquals(BookingStatus.PAYMENT_REFUNDED, booking.status());
+        assertEquals(1, payments.refunds().size());
     }
 
     @Test

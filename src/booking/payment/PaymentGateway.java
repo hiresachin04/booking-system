@@ -20,5 +20,6 @@ public interface PaymentGateway {
     /** The processor's own record: the source of truth when a call's outcome is unknown, e.g. it timed out. */
     PaymentStatus status(String authorizationId);
 
-    void refund(String paymentId, long amountPaise);
+    /** Same {@code idempotencyKey} twice must not refund twice, so a refund whose response was lost can be retried. */
+    void refund(String idempotencyKey, String paymentId, long amountPaise);
 }

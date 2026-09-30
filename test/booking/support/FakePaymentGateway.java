@@ -6,8 +6,10 @@ import booking.payment.PaymentStatus;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /** Stands in for the external processor, the one process boundary in this system. */
 public final class FakePaymentGateway implements PaymentGateway {
@@ -22,12 +24,15 @@ public final class FakePaymentGateway implements PaymentGateway {
     private final Map<String, PaymentStatus> states = new HashMap<>();
     private final List<Capture> captures = new ArrayList<>();
     private final List<Refund> refunds = new ArrayList<>();
+    private final Set<String> refundKeys = new HashSet<>();
     private int authorizeAttempts;
     private String declineNextWith;
     private RuntimeException failNextCapture;
     private RuntimeException loseNextCaptureResponse;
     private int unreachableStatusLookups;
     private RuntimeException failNextVoid;
+    private RuntimeException failNextRefund;
+    private RuntimeException loseNextRefundResponse;
     private Runnable duringAuthorize = () -> {};
 
     public synchronized void declineNext(String reason) {
@@ -45,6 +50,15 @@ public final class FakePaymentGateway implements PaymentGateway {
 
     public synchronized void failStatusLookups(int times) {
         unreachableStatusLookups = times;
+    }
+
+    public synchronized void failNextRefund(RuntimeException failure) {
+        failNextRefund = failure;
+    }
+
+    /** The next refund goes through at the processor but the caller gets {@code failure}, like a timeout. */
+    public synchronized void loseNextRefundResponse(RuntimeException failure) {
+        loseNextRefundResponse = failure;
     }
 
     public synchronized void failNextVoid(RuntimeException failure) {
@@ -119,11 +133,22 @@ public final class FakePaymentGateway implements PaymentGateway {
     }
 
     @Override
-    public synchronized void refund(String paymentId, long amountPaise) {
+    public synchronized void refund(String idempotencyKey, String paymentId, long amountPaise) {
+        if (failNextRefund != null) {
+            RuntimeException failure = failNextRefund;
+            failNextRefund = null;
+            throw failure;
+        }
         if (requireKnown(paymentId) != PaymentStatus.CAPTURED) {
             throw new IllegalStateException("refund of uncaptured " + paymentId);
         }
+        if (!refundKeys.add(idempotencyKey)) return;
         refunds.add(new Refund(paymentId, amountPaise));
+        if (loseNextRefundResponse != null) {
+            RuntimeException failure = loseNextRefundResponse;
+            loseNextRefundResponse = null;
+            throw failure;
+        }
     }
 
     private PaymentStatus requireKnown(String authorizationId) {

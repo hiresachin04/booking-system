@@ -55,6 +55,8 @@ public final class OutboxEntry {
         switch (type) {
             case CONFIRMED -> listener.onConfirmed(booking);
             case CANCELLED -> listener.onCancelled(booking);
+            case PAYMENT_FAILED -> listener.onPaymentFailed(booking);
+            case PAYMENT_REFUNDED -> listener.onPaymentRefunded(booking);
         }
     }
 

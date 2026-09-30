@@ -21,6 +21,7 @@ public final class Booking {
     private final DiscountCode discountCode;
     private BookingStatus status = BookingStatus.HELD;
     private String paymentId;
+    private Instant paymentPendingSince;
     private long refundedPaise;
 
     Booking(String id, User user, Show show, List<String> seatIds, PriceComponent price, Instant holdExpiresAt, DiscountCode discountCode) {
@@ -83,9 +84,24 @@ public final class Booking {
         this.paymentId = Objects.requireNonNull(paymentId, "paymentId");
     }
 
-    synchronized void markPaymentPending(String authorizationId) {
+    synchronized void markPaymentPending(String authorizationId, Instant since) {
         transitionTo(BookingStatus.PAYMENT_PENDING);
         this.paymentId = Objects.requireNonNull(authorizationId, "authorizationId");
+        this.paymentPendingSince = Objects.requireNonNull(since, "since");
+    }
+
+    synchronized Instant paymentPendingSince() {
+        if (paymentPendingSince == null) throw new IllegalStateException("booking " + id + " never went pending");
+        return paymentPendingSince;
+    }
+
+    synchronized void markPaymentUnresolved() {
+        transitionTo(BookingStatus.PAYMENT_UNRESOLVED);
+    }
+
+    synchronized void markPaymentRefunded(long refundedPaise) {
+        transitionTo(BookingStatus.PAYMENT_REFUNDED);
+        this.refundedPaise = refundedPaise;
     }
 
     synchronized void markExpired() {

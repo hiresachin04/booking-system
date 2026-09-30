@@ -23,8 +23,14 @@ class BookingStatusTest {
     }
 
     @Test
-    void pendingPaymentCanOnlyBeSettledOneWayOrTheOther() {
-        assertEquals(EnumSet.of(BookingStatus.CONFIRMED, BookingStatus.PAYMENT_FAILED), reachableFrom(BookingStatus.PAYMENT_PENDING));
+    void pendingPaymentCanBeSettledOrGiveUpItsSeats() {
+        assertEquals(EnumSet.of(BookingStatus.CONFIRMED, BookingStatus.PAYMENT_FAILED, BookingStatus.PAYMENT_UNRESOLVED),
+                reachableFrom(BookingStatus.PAYMENT_PENDING));
+    }
+
+    @Test
+    void unresolvedPaymentCanNeverBecomeConfirmedBecauseItsSeatsAreGone() {
+        assertEquals(EnumSet.of(BookingStatus.PAYMENT_FAILED, BookingStatus.PAYMENT_REFUNDED), reachableFrom(BookingStatus.PAYMENT_UNRESOLVED));
     }
 
     @Test
@@ -34,7 +40,8 @@ class BookingStatusTest {
 
     @Test
     void terminalStatesGoNowhere() {
-        for (BookingStatus terminal : EnumSet.of(BookingStatus.RELEASED, BookingStatus.EXPIRED, BookingStatus.PAYMENT_FAILED, BookingStatus.CANCELLED)) {
+        for (BookingStatus terminal : EnumSet.of(BookingStatus.RELEASED, BookingStatus.EXPIRED, BookingStatus.PAYMENT_FAILED,
+                BookingStatus.PAYMENT_REFUNDED, BookingStatus.CANCELLED)) {
             assertEquals(EnumSet.noneOf(BookingStatus.class), reachableFrom(terminal), terminal.name());
         }
     }
