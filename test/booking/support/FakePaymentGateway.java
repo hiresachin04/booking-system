@@ -2,6 +2,7 @@ package booking.support;
 
 import booking.payment.PaymentGateway;
 import booking.payment.PaymentResult;
+import booking.payment.PaymentStatus;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -10,8 +11,6 @@ import java.util.Map;
 
 /** Stands in for the external processor, the one process boundary in this system. */
 public final class FakePaymentGateway implements PaymentGateway {
-    public enum AuthorizationState { AUTHORIZED, CAPTURED, VOIDED }
-
     public record Capture(String authorizationId, String userId, long amountPaise) {}
 
     public record Refund(String paymentId, long amountPaise) {}
@@ -20,12 +19,14 @@ public final class FakePaymentGateway implements PaymentGateway {
 
     private final Map<String, String> authorizationIdByKey = new HashMap<>();
     private final Map<String, Authorization> authorizations = new HashMap<>();
-    private final Map<String, AuthorizationState> states = new HashMap<>();
+    private final Map<String, PaymentStatus> states = new HashMap<>();
     private final List<Capture> captures = new ArrayList<>();
     private final List<Refund> refunds = new ArrayList<>();
     private int authorizeAttempts;
     private String declineNextWith;
     private RuntimeException failNextCapture;
+    private RuntimeException loseNextCaptureResponse;
+    private int unreachableStatusLookups;
     private RuntimeException failNextVoid;
     private Runnable duringAuthorize = () -> {};
 
@@ -35,6 +36,15 @@ public final class FakePaymentGateway implements PaymentGateway {
 
     public synchronized void failNextCapture(RuntimeException failure) {
         failNextCapture = failure;
+    }
+
+    /** The next capture goes through at the processor but the caller gets {@code failure}, like a timeout. */
+    public synchronized void loseNextCaptureResponse(RuntimeException failure) {
+        loseNextCaptureResponse = failure;
+    }
+
+    public synchronized void failStatusLookups(int times) {
+        unreachableStatusLookups = times;
     }
 
     public synchronized void failNextVoid(RuntimeException failure) {
@@ -62,7 +72,7 @@ public final class FakePaymentGateway implements PaymentGateway {
         String authorizationId = "auth_" + (authorizations.size() + 1);
         authorizationIdByKey.put(idempotencyKey, authorizationId);
         authorizations.put(authorizationId, new Authorization(userId, amountPaise));
-        states.put(authorizationId, AuthorizationState.AUTHORIZED);
+        states.put(authorizationId, PaymentStatus.AUTHORIZED);
         return new PaymentResult.Approved(authorizationId);
     }
 
@@ -73,12 +83,17 @@ public final class FakePaymentGateway implements PaymentGateway {
             failNextCapture = null;
             throw failure;
         }
-        AuthorizationState state = requireKnown(authorizationId);
-        if (state == AuthorizationState.CAPTURED) return;
-        if (state == AuthorizationState.VOIDED) throw new IllegalStateException("capture of voided " + authorizationId);
+        PaymentStatus state = requireKnown(authorizationId);
+        if (state == PaymentStatus.CAPTURED) return;
+        if (state == PaymentStatus.VOIDED) throw new IllegalStateException("capture of voided " + authorizationId);
         Authorization auth = authorizations.get(authorizationId);
-        states.put(authorizationId, AuthorizationState.CAPTURED);
+        states.put(authorizationId, PaymentStatus.CAPTURED);
         captures.add(new Capture(authorizationId, auth.userId(), auth.amountPaise()));
+        if (loseNextCaptureResponse != null) {
+            RuntimeException failure = loseNextCaptureResponse;
+            loseNextCaptureResponse = null;
+            throw failure;
+        }
     }
 
     @Override
@@ -88,22 +103,31 @@ public final class FakePaymentGateway implements PaymentGateway {
             failNextVoid = null;
             throw failure;
         }
-        if (requireKnown(authorizationId) != AuthorizationState.AUTHORIZED) {
+        if (requireKnown(authorizationId) != PaymentStatus.AUTHORIZED) {
             throw new IllegalStateException("void of " + states.get(authorizationId) + " " + authorizationId);
         }
-        states.put(authorizationId, AuthorizationState.VOIDED);
+        states.put(authorizationId, PaymentStatus.VOIDED);
+    }
+
+    @Override
+    public synchronized PaymentStatus status(String authorizationId) {
+        if (unreachableStatusLookups > 0) {
+            unreachableStatusLookups--;
+            throw new RuntimeException("processor unreachable");
+        }
+        return requireKnown(authorizationId);
     }
 
     @Override
     public synchronized void refund(String paymentId, long amountPaise) {
-        if (requireKnown(paymentId) != AuthorizationState.CAPTURED) {
+        if (requireKnown(paymentId) != PaymentStatus.CAPTURED) {
             throw new IllegalStateException("refund of uncaptured " + paymentId);
         }
         refunds.add(new Refund(paymentId, amountPaise));
     }
 
-    private AuthorizationState requireKnown(String authorizationId) {
-        AuthorizationState state = states.get(authorizationId);
+    private PaymentStatus requireKnown(String authorizationId) {
+        PaymentStatus state = states.get(authorizationId);
         if (state == null) throw new IllegalArgumentException("unknown authorization " + authorizationId);
         return state;
     }
@@ -113,7 +137,7 @@ public final class FakePaymentGateway implements PaymentGateway {
         return authorizeAttempts;
     }
 
-    public synchronized AuthorizationState state(String authorizationId) {
+    public synchronized PaymentStatus state(String authorizationId) {
         return requireKnown(authorizationId);
     }
 

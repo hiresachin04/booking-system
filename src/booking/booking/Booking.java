@@ -65,7 +65,7 @@ public final class Booking {
         return status;
     }
 
-    /** The captured authorization; present only once confirmed. */
+    /** The authorization, recorded once capture has been attempted so an unknown outcome can be looked up. */
     public synchronized Optional<String> paymentId() {
         return Optional.ofNullable(paymentId);
     }
@@ -81,6 +81,11 @@ public final class Booking {
     synchronized void markConfirmed(String paymentId) {
         transitionTo(BookingStatus.CONFIRMED);
         this.paymentId = Objects.requireNonNull(paymentId, "paymentId");
+    }
+
+    synchronized void markPaymentPending(String authorizationId) {
+        transitionTo(BookingStatus.PAYMENT_PENDING);
+        this.paymentId = Objects.requireNonNull(authorizationId, "authorizationId");
     }
 
     synchronized void markExpired() {

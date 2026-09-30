@@ -20,6 +20,10 @@ public final class BookingRepository {
         return Optional.ofNullable(bookings.get(bookingId));
     }
 
+    public List<Booking> findByStatus(BookingStatus status) {
+        return bookings.values().stream().filter(b -> b.status() == status).toList();
+    }
+
     public List<Booking> findByUser(User user) {
         return bookings.values().stream().filter(b -> b.user().equals(user)).toList();
     }

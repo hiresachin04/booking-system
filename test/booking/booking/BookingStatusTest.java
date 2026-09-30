@@ -17,9 +17,14 @@ class BookingStatusTest {
     }
 
     @Test
-    void heldCanOnlyBeConfirmedReleasedExpiredOrFailPayment() {
-        assertEquals(EnumSet.of(BookingStatus.CONFIRMED, BookingStatus.RELEASED, BookingStatus.EXPIRED, BookingStatus.PAYMENT_FAILED),
+    void heldCanOnlyBeConfirmedReleasedExpiredOrGoPending() {
+        assertEquals(EnumSet.of(BookingStatus.CONFIRMED, BookingStatus.RELEASED, BookingStatus.EXPIRED, BookingStatus.PAYMENT_PENDING),
                 reachableFrom(BookingStatus.HELD));
+    }
+
+    @Test
+    void pendingPaymentCanOnlyBeSettledOneWayOrTheOther() {
+        assertEquals(EnumSet.of(BookingStatus.CONFIRMED, BookingStatus.PAYMENT_FAILED), reachableFrom(BookingStatus.PAYMENT_PENDING));
     }
 
     @Test

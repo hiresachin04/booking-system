@@ -11,6 +11,7 @@ import booking.model.User;
 import booking.notify.BookingListener;
 import booking.payment.PaymentGateway;
 import booking.payment.PaymentResult;
+import booking.payment.PaymentStatus;
 import booking.pricing.PriceQuoteBuilder;
 
 import java.time.Clock;
@@ -115,17 +116,21 @@ public final class BookingService {
                 throw e;
             }
 
-            // Seats are secured; take the money. If that fails, give the seats back rather than keep them unpaid.
+            // Seats are secured; take the money. A failed capture call doesn't prove the money wasn't taken (the
+            // response may have timed out after the processor captured), so the seats stay ours until it says so.
             try {
                 payments.capture(authorizationId);
-            } catch (RuntimeException e) {
-                inventory.cancel(booking.id(), booking.seatIds());
-                if (discount != null) discount.releaseUse();
-                booking.markPaymentFailed();
-                voidAuthorization(authorizationId, e);
-                throw e;
+            } catch (RuntimeException captureFailure) {
+                booking.markPaymentPending(authorizationId);
+                try {
+                    settlePendingPayment(booking, inventory);
+                } catch (RuntimeException settleFailure) {
+                    captureFailure.addSuppressed(settleFailure);
+                    throw new PaymentPendingException(booking.id(), captureFailure);
+                }
+                if (booking.status() == BookingStatus.PAYMENT_FAILED) throw captureFailure;
             }
-            booking.markConfirmed(authorizationId);
+            if (booking.status() != BookingStatus.CONFIRMED) booking.markConfirmed(authorizationId);
         }
         notifyListeners(l -> l.onConfirmed(booking));
         return booking;
@@ -167,6 +172,54 @@ public final class BookingService {
             case PaymentResult.Approved approved -> approved.authorizationId();
             case PaymentResult.Declined declined -> throw new PaymentDeclinedException(booking.id(), declined.reason());
         };
+    }
+
+    /**
+     * Retries every booking whose capture outcome is still unknown. Meant to run on a schedule. Each booking that
+     * can't be settled yet stays PAYMENT_PENDING for the next run; the first such failure is thrown after all have
+     * been tried, with the rest suppressed.
+     */
+    public void reconcilePendingPayments() {
+        RuntimeException failure = null;
+        for (Booking booking : bookings.findByStatus(BookingStatus.PAYMENT_PENDING)) {
+            ShowInventory inventory = inventoryOf(booking.show().id());
+            boolean confirmed;
+            synchronized (booking) {
+                if (booking.status() != BookingStatus.PAYMENT_PENDING) continue;
+                try {
+                    settlePendingPayment(booking, inventory);
+                } catch (RuntimeException e) {
+                    if (failure == null) failure = e;
+                    else failure.addSuppressed(e);
+                    continue;
+                }
+                confirmed = booking.status() == BookingStatus.CONFIRMED;
+            }
+            if (confirmed) notifyListeners(l -> l.onConfirmed(booking));
+        }
+        if (failure != null) throw failure;
+    }
+
+    /**
+     * Lets the processor's record decide a PAYMENT_PENDING booking. Seats are freed only once the processor says
+     * the money can no longer be taken; if it can't be reached, or the void fails, this throws and nothing changes.
+     */
+    private void settlePendingPayment(Booking booking, ShowInventory inventory) {
+        String authorizationId = booking.paymentId().orElseThrow();
+        PaymentStatus status = payments.status(authorizationId);
+        if (status == PaymentStatus.AUTHORIZED) {
+            payments.voidAuthorization(authorizationId);
+            status = PaymentStatus.VOIDED;
+        }
+        switch (status) {
+            case CAPTURED -> booking.markConfirmed(authorizationId);
+            case VOIDED -> {
+                inventory.cancel(booking.id(), booking.seatIds());
+                booking.discountCode().ifPresent(DiscountCode::releaseUse);
+                booking.markPaymentFailed();
+            }
+            case AUTHORIZED -> throw new IllegalStateException("unreachable: authorization was just voided");
+        }
     }
 
     // A failed void rides along on the primary exception instead of replacing it. It isn't fatal: an authorization

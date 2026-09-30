@@ -11,8 +11,14 @@ public interface PaymentGateway {
     /** Takes the reserved funds. Capturing the same authorization twice must not charge twice. */
     void capture(String authorizationId);
 
-    /** Releases reserved funds early; an authorization that is never captured also lapses on its own. */
+    /**
+     * Releases reserved funds early; an authorization that is never captured also lapses on its own. Once voided,
+     * the processor rejects any capture of it, including one still in flight.
+     */
     void voidAuthorization(String authorizationId);
+
+    /** The processor's own record: the source of truth when a call's outcome is unknown, e.g. it timed out. */
+    PaymentStatus status(String authorizationId);
 
     void refund(String paymentId, long amountPaise);
 }

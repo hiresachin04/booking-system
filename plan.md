@@ -43,13 +43,13 @@ class FlatDiscount     extends PriceDecorator    // -fixed paise, never below 0
 - Expiry is **lazy**. An expired hold counts as available wherever it's read, so correctness never depends on a sweeper thread.
 - Payment is **two-phase** and the slow step runs **outside** the lock: hold (lock) → authorize funds (no lock) → confirm seats (lock) → capture.
   - Hold expired during authorization: the authorization is voided and the booking marked `EXPIRED`. No money was taken, so a failed void only delays releasing the customer's funds (an uncaptured authorization lapses on its own). The void failure is attached to the thrown `HoldExpiredException` as suppressed.
-  - Capture fails after the seats were booked: the seats are freed, the discount use is returned, the authorization is voided, and the booking goes to `PAYMENT_FAILED`. The capture error propagates.
-  - Not handled: a capture that *succeeds* at the processor but times out on our side. Settling that needs a payment-status lookup (reconciliation), which the gateway interface doesn't offer yet.
+  - Capture call fails after the seats were booked: the error doesn't prove the money wasn't taken (a timeout can follow a successful capture), so the booking goes `PAYMENT_PENDING`, keeps its seats, and asks the processor via `status()`. `CAPTURED` → `CONFIRMED`. `AUTHORIZED` → void it, and only once the void succeeds free the seats, return the discount use and mark `PAYMENT_FAILED`. The gateway contract is that a voided authorization can't be captured later, so a late capture can't land on freed seats. If the lookup or the void fails, it stays pending and `confirm` throws `PaymentPendingException`.
+  - `reconcilePendingPayments()` re-runs that settlement for every pending booking. It's meant to run on a schedule, and a booking that can't be settled yet doesn't stop the others. Invariant: a seat is freed only once the processor confirms no money was taken.
 
 ## 3. Other patterns (only where they earn it)
 | Pattern | Where | Why |
 |---|---|---|
-| State | `BookingStatus` enum with `canTransitionTo`: HELD→CONFIRMED/RELEASED/EXPIRED/PAYMENT_FAILED, CONFIRMED→CANCELLED | All illegal transitions are rejected in one place (`IllegalBookingStateException`). |
+| State | `BookingStatus` enum with `canTransitionTo`: HELD→CONFIRMED/RELEASED/EXPIRED/PAYMENT_PENDING, PAYMENT_PENDING→CONFIRMED/PAYMENT_FAILED, CONFIRMED→CANCELLED | All illegal transitions are rejected in one place (`IllegalBookingStateException`). |
 | Strategy | `PaymentGateway`, `RefundPolicy` (tiered by hours before show) | Swappable. `FakePaymentGateway` in `test/` is the only fake, because payment is the process boundary. |
 | Facade | `BookingService`: `holdSeats`, `confirm`, `release`, `cancel` | Callers see one API. Inventory, pricing, payment, discounts and listeners stay behind it. |
 | Observer | `BookingListener` (`onConfirmed`, `onCancelled`) registered on `BookingService` | Booking code doesn't know notifications exist. If a listener throws, the exception propagates *after* the state change is committed. It is not swallowed. |
