@@ -1,0 +1,7 @@
+out/
+.idea/workspace.xml
+.idea/shelf/
+*.class
+.DS_Store
+.claude/settings.local.json
+build/
