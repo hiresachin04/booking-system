@@ -5,3 +5,5 @@ out/
 .DS_Store
 .claude/settings.local.json
 build/
+# Local credentials, e.g. Razorpay test keys; never committed.
+secrets/
