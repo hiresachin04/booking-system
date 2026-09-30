@@ -8,7 +8,7 @@ import booking.booking.TieredRefundPolicy;
 import booking.model.User;
 import booking.notify.BookingEvent;
 import booking.notify.BookingListener;
-import booking.notify.RetryPolicy;
+import booking.retry.RetryPolicy;
 import booking.support.FakePaymentGateway;
 import booking.support.Fixtures;
 import booking.support.MutableClock;

@@ -1,5 +1,7 @@
 package booking.notify;
 
+import booking.retry.RetryPolicy;
+
 import java.time.Instant;
 import java.util.Objects;
 import java.util.Optional;

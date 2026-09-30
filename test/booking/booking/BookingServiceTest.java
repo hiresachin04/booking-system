@@ -13,7 +13,7 @@ import booking.notify.BookingListener;
 import booking.notify.DeliveryStatus;
 import booking.notify.NotificationOutbox;
 import booking.notify.OutboxEntry;
-import booking.notify.RetryPolicy;
+import booking.retry.RetryPolicy;
 import booking.payment.PaymentStatus;
 import booking.pricing.Discount;
 import booking.support.FakePaymentGateway;

@@ -1,4 +1,4 @@
-package booking.notify;
+package booking.retry;
 
 import java.time.Duration;
 import java.util.Objects;
@@ -14,7 +14,7 @@ public record RetryPolicy(int maxAttempts, Duration initialBackoff) {
         if (initialBackoff.isNegative() || initialBackoff.isZero()) throw new IllegalArgumentException("initialBackoff must be positive");
     }
 
-    Duration backoffAfter(int failedAttempts) {
+    public Duration backoffAfter(int failedAttempts) {
         return initialBackoff.multipliedBy(1L << Math.min(failedAttempts - 1, MAX_DOUBLINGS));
     }
 }

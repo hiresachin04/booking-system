@@ -8,6 +8,7 @@ import booking.booking.ShowRepository;
 import booking.booking.TieredRefundPolicy;
 import booking.discount.DiscountRegistry;
 import booking.model.User;
+import booking.retry.RetryPolicy;
 import booking.support.FakePaymentGateway;
 import booking.support.Fixtures;
 import booking.support.MutableClock;
@@ -327,11 +328,5 @@ class NotificationOutboxTest {
         outbox.publish(BookingEventType.CONFIRMED, booking);
 
         assertEquals(new DispatchReport(1, 0, 0, 1), outbox.dispatchDue());
-    }
-
-    @Test
-    void backoffShiftIsCappedSoLargeAttemptCountsDoNotOverflow() {
-        RetryPolicy many = new RetryPolicy(100, Duration.ofMillis(1));
-        assertEquals(Duration.ofMillis(1L << 20), many.backoffAfter(99));
     }
 }

@@ -1,6 +1,7 @@
 package booking.notify;
 
 import booking.booking.Booking;
+import booking.retry.RetryPolicy;
 
 import java.time.Clock;
 import java.time.Duration;

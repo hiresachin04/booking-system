@@ -8,7 +8,7 @@ import booking.booking.ShowRepository;
 import booking.discount.DiscountRegistry;
 import booking.notify.BookingListener;
 import booking.notify.NotificationOutbox;
-import booking.notify.RetryPolicy;
+import booking.retry.RetryPolicy;
 import booking.payment.PaymentGateway;
 
 import java.time.Clock;
