@@ -1,0 +1,6 @@
+# Who can decrypt secrets/*.env: one age public key per person. To add someone, append their public key
+# (age-keygen -y on their key file) and run `sops updatekeys secrets/<file>.enc.env`.
+creation_rules:
+  - path_regex: ^secrets/.*\.env$
+    age: >-
+      age10vkpu455yrzryxd9affpqqkzjgh2cawfudlfwa23zvyuv4w4x9ts7mmdvt

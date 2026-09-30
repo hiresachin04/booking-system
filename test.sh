@@ -8,13 +8,26 @@ JUNIT=lib/junit-platform-console-standalone-6.1.3.jar
 JSON=lib/json-20260814.jar
 BUILD=build
 
-# --live loads Razorpay test keys from secrets/razorpay.env so RazorpayLiveTest runs against Razorpay's test mode.
-# Opt-in so the normal suite never needs the network.
+SECRETS=secrets/razorpay.enc.env
+SOPS=$(command -v sops || echo "$HOME/.local/bin/sops")
+
+# Anything named *.enc.env is committable, so each one must really be sops-encrypted, never plaintext.
+for f in secrets/*.enc.env; do
+  if [[ -f "$f" ]] && ! grep -q '^sops_mac=' "$f"; then echo "$f is not sops-encrypted; refusing to continue" >&2; exit 1; fi
+done
+
+# --live decrypts the Razorpay test keys so RazorpayLiveTest runs against Razorpay's test mode.
+# Opt-in so the normal suite never needs the network or the age key.
 ARGS=()
 for arg in "$@"; do
   if [[ "$arg" == --live ]]; then
-    if [[ ! -f secrets/razorpay.env ]]; then echo "--live needs secrets/razorpay.env (see CLAUDE.md)" >&2; exit 1; fi
-    set -a; source secrets/razorpay.env; set +a
+    if [[ ! -x "$SOPS" ]]; then echo "--live needs sops (see CLAUDE.md)" >&2; exit 1; fi
+    DECRYPTED=$("$SOPS" decrypt "$SECRETS")
+    # Exported line by line rather than sourced, so nothing in a value is ever run as shell.
+    while IFS='=' read -r name value; do
+      if [[ -z "$name" || "$name" == \#* ]]; then continue; fi
+      export "$name=$value"
+    done <<< "$DECRYPTED"
     if [[ "${RAZORPAY_KEY_ID:-}" != rzp_test_* ]]; then echo "refusing --live: RAZORPAY_KEY_ID is not a test key" >&2; exit 1; fi
   else
     ARGS+=("$arg")

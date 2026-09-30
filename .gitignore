@@ -5,5 +5,6 @@ out/
 .DS_Store
 .claude/settings.local.json
 build/
-# Local credentials, e.g. Razorpay test keys; never committed.
-secrets/
+# Plaintext credentials are never committed; only sops-encrypted *.enc.env files are (see .sops.yaml).
+secrets/*
+!secrets/*.enc.env
