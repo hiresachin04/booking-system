@@ -84,7 +84,7 @@ class BookingServiceTest {
                 new BookingConfig(TTL, MAX_SEATS, 1_000, MAX_PENDING), clock, outbox);
     }
 
-    private final NotificationOutbox outbox = new NotificationOutbox(List.of(recorder), new RetryPolicy(3, Duration.ofSeconds(30)), clock);
+    private final NotificationOutbox outbox = new NotificationOutbox(List.of(recorder), new RetryPolicy(3, Duration.ofSeconds(30)), Duration.ofDays(30), clock);
     private final BookingService service = service(outbox);
 
     private List<String> deliveredEvents() {
@@ -727,7 +727,7 @@ class BookingServiceTest {
                 throw boom;
             }
         };
-        NotificationOutbox brokenOutbox = new NotificationOutbox(List.of(broken, recorder), new RetryPolicy(3, Duration.ofSeconds(30)), clock);
+        NotificationOutbox brokenOutbox = new NotificationOutbox(List.of(broken, recorder), new RetryPolicy(3, Duration.ofSeconds(30)), Duration.ofDays(30), clock);
         BookingService withBrokenListener = service(brokenOutbox);
         Booking booking = withBrokenListener.holdSeats(alice, "sh", List.of("A1"));
 

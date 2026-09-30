@@ -12,6 +12,7 @@ public final class OutboxEntry {
     private int attempts;
     private Instant nextAttemptAt;
     private RuntimeException lastError;
+    private Instant sentAt;
 
     OutboxEntry(BookingEvent event, BookingListener listener, Instant dueAt) {
         this.event = Objects.requireNonNull(event, "event");
@@ -52,10 +53,15 @@ public final class OutboxEntry {
         }
     }
 
-    synchronized void markSent() {
+    synchronized void markSent(Instant now) {
         attempts++;
         status = DeliveryStatus.SENT;
         lastError = null;
+        sentAt = now;
+    }
+
+    synchronized boolean isSentBefore(Instant cutoff) {
+        return status == DeliveryStatus.SENT && !sentAt.isAfter(cutoff);
     }
 
     synchronized void markFailedAttempt(RuntimeException error, Instant now, RetryPolicy retry) {

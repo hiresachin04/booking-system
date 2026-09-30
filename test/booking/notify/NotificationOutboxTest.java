@@ -29,6 +29,7 @@ class NotificationOutboxTest {
     private static final Instant NOW = Instant.parse("2026-10-01T06:30:00Z");
     private static final Duration BACKOFF = Duration.ofSeconds(30);
     private static final RetryPolicy RETRY = new RetryPolicy(3, BACKOFF);
+    private static final Duration RETENTION = Duration.ofDays(30);
 
     private final MutableClock clock = new MutableClock(NOW);
     private final Booking booking = confirmedBooking();
@@ -68,7 +69,7 @@ class NotificationOutboxTest {
         shows.add(Fixtures.show("sh", NOW.plus(Duration.ofHours(8))));
         BookingService service = new BookingService(shows, new BookingRepository(), new DiscountRegistry(), new FakePaymentGateway(),
                 new TieredRefundPolicy(List.of()), new BookingConfig(Duration.ofMinutes(10), 10, 0, Duration.ofMinutes(15)), clock,
-                new NotificationOutbox(List.of(), RETRY, clock));
+                new NotificationOutbox(List.of(), RETRY, RETENTION, clock));
         User alice = new User("u1", "Alice");
         Booking b = service.holdSeats(alice, "sh", List.of("A1"));
         return service.confirm(alice, b.id());
@@ -77,7 +78,7 @@ class NotificationOutboxTest {
     @Test
     void publishRecordsWithoutCallingTheListener() {
         FlakyListener listener = new FlakyListener(0, null);
-        NotificationOutbox outbox = new NotificationOutbox(List.of(listener), RETRY, clock);
+        NotificationOutbox outbox = new NotificationOutbox(List.of(listener), RETRY, RETENTION, clock);
 
         outbox.publish(BookingEventType.CONFIRMED, booking);
 
@@ -88,7 +89,7 @@ class NotificationOutboxTest {
     @Test
     void deliversEachEventTypeToTheMatchingCallback() {
         FlakyListener listener = new FlakyListener(0, null);
-        NotificationOutbox outbox = new NotificationOutbox(List.of(listener), RETRY, clock);
+        NotificationOutbox outbox = new NotificationOutbox(List.of(listener), RETRY, RETENTION, clock);
         outbox.publish(BookingEventType.CONFIRMED, booking);
         outbox.publish(BookingEventType.CANCELLED, booking);
 
@@ -101,7 +102,7 @@ class NotificationOutboxTest {
     @Test
     void neverRedeliversASentEntry() {
         FlakyListener listener = new FlakyListener(0, null);
-        NotificationOutbox outbox = new NotificationOutbox(List.of(listener), RETRY, clock);
+        NotificationOutbox outbox = new NotificationOutbox(List.of(listener), RETRY, RETENTION, clock);
         outbox.publish(BookingEventType.CONFIRMED, booking);
 
         outbox.dispatchDue();
@@ -114,7 +115,7 @@ class NotificationOutboxTest {
     @Test
     void retriesOnlyOnceTheBackoffHasElapsed() {
         FlakyListener listener = new FlakyListener(1, new RuntimeException("smtp 421"));
-        NotificationOutbox outbox = new NotificationOutbox(List.of(listener), RETRY, clock);
+        NotificationOutbox outbox = new NotificationOutbox(List.of(listener), RETRY, RETENTION, clock);
         outbox.publish(BookingEventType.CONFIRMED, booking);
         outbox.dispatchDue();
 
@@ -131,7 +132,7 @@ class NotificationOutboxTest {
     @Test
     void doublesTheBackoffAfterEachFailure() {
         FlakyListener listener = new FlakyListener(2, new RuntimeException("smtp 421"));
-        NotificationOutbox outbox = new NotificationOutbox(List.of(listener), RETRY, clock);
+        NotificationOutbox outbox = new NotificationOutbox(List.of(listener), RETRY, RETENTION, clock);
         outbox.publish(BookingEventType.CONFIRMED, booking);
         outbox.dispatchDue();
         clock.advance(BACKOFF);
@@ -144,7 +145,7 @@ class NotificationOutboxTest {
     @Test
     void deliversOnTheThirdAttemptAfterTwoFailures() {
         FlakyListener listener = new FlakyListener(2, new RuntimeException("smtp 421"));
-        NotificationOutbox outbox = new NotificationOutbox(List.of(listener), RETRY, clock);
+        NotificationOutbox outbox = new NotificationOutbox(List.of(listener), RETRY, RETENTION, clock);
         outbox.publish(BookingEventType.CONFIRMED, booking);
 
         outbox.dispatchDue();
@@ -163,7 +164,7 @@ class NotificationOutboxTest {
     void parksTheEntryAsFailedWithItsErrorAfterMaxAttempts() {
         RuntimeException down = new RuntimeException("mailer down");
         FlakyListener listener = new FlakyListener(Integer.MAX_VALUE, down);
-        NotificationOutbox outbox = new NotificationOutbox(List.of(listener), RETRY, clock);
+        NotificationOutbox outbox = new NotificationOutbox(List.of(listener), RETRY, RETENTION, clock);
         outbox.publish(BookingEventType.CONFIRMED, booking);
 
         for (int i = 0; i < 10; i++) {
@@ -181,7 +182,7 @@ class NotificationOutboxTest {
     void retryingOneListenerNeverResendsToAnotherThatAlreadySucceeded() {
         FlakyListener email = new FlakyListener(1, new RuntimeException("smtp 421"));
         FlakyListener sms = new FlakyListener(0, null);
-        NotificationOutbox outbox = new NotificationOutbox(List.of(email, sms), RETRY, clock);
+        NotificationOutbox outbox = new NotificationOutbox(List.of(email, sms), RETRY, RETENTION, clock);
         outbox.publish(BookingEventType.CONFIRMED, booking);
 
         outbox.dispatchDue();
@@ -197,7 +198,7 @@ class NotificationOutboxTest {
     void oneFailingListenerDoesNotStopDeliveryToTheRest() {
         FlakyListener broken = new FlakyListener(Integer.MAX_VALUE, new RuntimeException("mailer down"));
         FlakyListener sms = new FlakyListener(0, null);
-        NotificationOutbox outbox = new NotificationOutbox(List.of(broken, sms), RETRY, clock);
+        NotificationOutbox outbox = new NotificationOutbox(List.of(broken, sms), RETRY, RETENTION, clock);
         outbox.publish(BookingEventType.CONFIRMED, booking);
 
         outbox.dispatchDue();
@@ -224,7 +225,7 @@ class NotificationOutboxTest {
     @Test
     void retriesCarryTheSameEventId() {
         IdRecorder listener = new IdRecorder(1);
-        NotificationOutbox outbox = new NotificationOutbox(List.of(listener), RETRY, clock);
+        NotificationOutbox outbox = new NotificationOutbox(List.of(listener), RETRY, RETENTION, clock);
         outbox.publish(BookingEventType.CONFIRMED, booking);
 
         outbox.dispatchDue();
@@ -239,7 +240,7 @@ class NotificationOutboxTest {
     void everyPublishGetsItsOwnIdSharedByAllListeners() {
         IdRecorder email = new IdRecorder(0);
         IdRecorder sms = new IdRecorder(0);
-        NotificationOutbox outbox = new NotificationOutbox(List.of(email, sms), RETRY, clock);
+        NotificationOutbox outbox = new NotificationOutbox(List.of(email, sms), RETRY, RETENTION, clock);
         outbox.publish(BookingEventType.CONFIRMED, booking);
         outbox.publish(BookingEventType.CONFIRMED, booking);
 
@@ -274,7 +275,7 @@ class NotificationOutboxTest {
                 }
             }
         };
-        NotificationOutbox outbox = new NotificationOutbox(List.of(emailer), RETRY, clock);
+        NotificationOutbox outbox = new NotificationOutbox(List.of(emailer), RETRY, RETENTION, clock);
         outbox.publish(BookingEventType.CONFIRMED, booking);
 
         outbox.dispatchDue();
@@ -283,6 +284,49 @@ class NotificationOutboxTest {
 
         assertEquals(1, provider.sent.size());
         assertEquals(1, outbox.entries(DeliveryStatus.SENT).size());
+    }
+
+    @Test
+    void purgesASentEntryExactlyWhenItsRetentionEnds() {
+        Duration retention = Duration.ofHours(1);
+        NotificationOutbox outbox = new NotificationOutbox(List.of(new FlakyListener(0, null)), RETRY, retention, clock);
+        outbox.publish(BookingEventType.CONFIRMED, booking);
+        assertEquals(new DispatchReport(1, 0, 0, 0), outbox.dispatchDue());
+
+        clock.advance(retention.minusNanos(1));
+        assertEquals(0, outbox.dispatchDue().purged());
+        assertEquals(1, outbox.entries(DeliveryStatus.SENT).size());
+
+        clock.advance(Duration.ofNanos(1));
+        assertEquals(1, outbox.dispatchDue().purged());
+        assertEquals(List.of(), outbox.entries(DeliveryStatus.SENT));
+    }
+
+    @Test
+    void neverPurgesPendingOrFailedEntries() {
+        FlakyListener broken = new FlakyListener(Integer.MAX_VALUE, new RuntimeException("mailer down"));
+        FlakyListener flaky = new FlakyListener(Integer.MAX_VALUE, new RuntimeException("smtp 421"));
+        NotificationOutbox parkedOutbox = new NotificationOutbox(List.of(broken), new RetryPolicy(1, BACKOFF), Duration.ZERO, clock);
+        NotificationOutbox retryingOutbox = new NotificationOutbox(List.of(flaky), new RetryPolicy(100, Duration.ofDays(365)), Duration.ZERO, clock);
+        parkedOutbox.publish(BookingEventType.CONFIRMED, booking);
+        retryingOutbox.publish(BookingEventType.CONFIRMED, booking);
+
+        assertEquals(new DispatchReport(0, 1, 1, 0), parkedOutbox.dispatchDue());
+        retryingOutbox.dispatchDue();
+        clock.advance(Duration.ofDays(30));
+        parkedOutbox.dispatchDue();
+        retryingOutbox.dispatchDue();
+
+        assertEquals(1, parkedOutbox.entries(DeliveryStatus.FAILED).size());
+        assertEquals(1, retryingOutbox.entries(DeliveryStatus.PENDING).size());
+    }
+
+    @Test
+    void zeroRetentionPurgesSentEntriesInTheSameRun() {
+        NotificationOutbox outbox = new NotificationOutbox(List.of(new FlakyListener(0, null)), RETRY, Duration.ZERO, clock);
+        outbox.publish(BookingEventType.CONFIRMED, booking);
+
+        assertEquals(new DispatchReport(1, 0, 0, 1), outbox.dispatchDue());
     }
 
     @Test
