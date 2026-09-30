@@ -118,6 +118,7 @@ public final class FakePaymentGateway implements PaymentGateway {
 
     @Override
     public synchronized PaymentResult authorize(String idempotencyKey, String userId, long amountPaise) {
+        requireValidKey(idempotencyKey);
         authorizeAttempts++;
         Runnable action = duringAuthorize;
         duringAuthorize = () -> {};
@@ -137,7 +138,7 @@ public final class FakePaymentGateway implements PaymentGateway {
     }
 
     @Override
-    public synchronized void capture(String authorizationId) {
+    public synchronized void capture(String authorizationId, long amountPaise) {
         captureAttempts++;
         if (unavailableCaptures > 0) {
             unavailableCaptures--;
@@ -155,6 +156,9 @@ public final class FakePaymentGateway implements PaymentGateway {
         }
         if (state == PaymentStatus.RELEASED) throw new PaymentRejectedException("BAD_REQUEST_ERROR: payment is not authorized: " + authorizationId);
         Authorization auth = authorizations.get(authorizationId);
+        if (amountPaise != auth.amountPaise()) {
+            throw new PaymentRejectedException("BAD_REQUEST_ERROR: capture amount must be equal to the authorized amount");
+        }
         states.put(authorizationId, PaymentStatus.CAPTURED);
         captures.add(new Capture(authorizationId, auth.userId(), auth.amountPaise()));
         if (loseNextCaptureResponse != null) {
@@ -190,6 +194,7 @@ public final class FakePaymentGateway implements PaymentGateway {
 
     @Override
     public synchronized void refund(String idempotencyKey, String paymentId, long amountPaise) {
+        requireValidKey(idempotencyKey);
         if (failNextRefund != null) {
             RuntimeException failure = failNextRefund;
             failNextRefund = null;
@@ -205,6 +210,10 @@ public final class FakePaymentGateway implements PaymentGateway {
             loseNextRefundResponse = null;
             throw failure;
         }
+    }
+
+    private static void requireValidKey(String key) {
+        if (!key.matches("[A-Za-z0-9_-]{10,}")) throw new PaymentRejectedException("BAD_REQUEST_ERROR: invalid idempotency key " + key);
     }
 
     // Expiry is applied whenever the payment is looked at, so it tracks the test clock without a timer.

@@ -121,7 +121,7 @@ public final class BookingService {
             // Seats are secured; take the money. A failed capture call doesn't prove the money wasn't taken (the
             // response may have timed out after the processor captured), so the seats stay ours until it says so.
             try {
-                payments.capture(authorizationId);
+                payments.capture(authorizationId, booking.price().totalPaise());
             } catch (RuntimeException captureFailure) {
                 Instant failedAt = clock.instant();
                 booking.markPaymentPending(authorizationId, failedAt);
@@ -169,7 +169,7 @@ public final class BookingService {
             long refund = refundPolicy.refundPaise(booking.price().totalPaise(), Duration.between(now, booking.show().startsAt()));
             String paymentId = booking.paymentId().orElseThrow(() -> new IllegalStateException("confirmed booking " + bookingId + " has no payment"));
             // Refund first: if the gateway fails, the booking and its seats are untouched and the cancel can be retried.
-            if (refund > 0) payments.refund(booking.id() + ":cancel", paymentId, refund);
+            if (refund > 0) payments.refund(booking.id() + "_cancel", paymentId, refund);
             inventory.cancel(booking.id(), booking.seatIds());
             booking.markCancelled(refund);
             outbox.publish(BookingEventType.CANCELLED, booking);
@@ -270,7 +270,7 @@ public final class BookingService {
                     booking.markConfirmed(authorizationId);
                 } else {
                     long paid = booking.price().totalPaise();
-                    payments.refund(booking.id() + ":unresolved", authorizationId, paid);
+                    payments.refund(booking.id() + "_unresolved", authorizationId, paid);
                     booking.discountCode().ifPresent(DiscountCode::releaseUse);
                     booking.markPaymentRefunded(paid);
                 }
@@ -287,7 +287,7 @@ public final class BookingService {
 
     private PaymentStatus retryCapture(Booking booking, String authorizationId) {
         try {
-            payments.capture(authorizationId);
+            payments.capture(authorizationId, booking.price().totalPaise());
             return PaymentStatus.CAPTURED;
         } catch (PaymentRejectedException e) {
             booking.recordFailedCapture(clock.instant(), true, config.captureRetry());

@@ -2,7 +2,8 @@ package booking.payment;
 
 /**
  * Two-phase payment: funds are reserved first and only taken once the seats are secured, so losing the seats
- * during payment never leaves the customer charged.
+ * during payment never leaves the customer charged. Idempotency keys are at least 10 characters of letters, digits,
+ * {@code -} and {@code _}, the strictest rule among supported processors (Razorpay's).
  */
 public interface PaymentGateway {
     /** Reserves funds without taking them. Same {@code idempotencyKey} twice must not reserve twice. */
@@ -13,7 +14,7 @@ public interface PaymentGateway {
      * succeed or throw {@link PaymentRejectedException}. A refusal that retrying can't fix is thrown as
      * {@link PaymentRejectedException}; any other exception means the outcome is unknown.
      */
-    void capture(String authorizationId);
+    void capture(String authorizationId, long amountPaise);
 
     /**
      * Cancels the authorization now if the processor supports that, returning {@code true}; once voided, any capture

@@ -47,8 +47,8 @@ class PaymentGatewayContractTest {
     @MethodSource("profiles")
     void authorizingTwiceWithOneKeyReservesOnce(Profile profile) {
         FakePaymentGateway gateway = profile.create().apply(clock);
-        String first = authorize(gateway, "booking-1");
-        String second = authorize(gateway, "booking-1");
+        String first = authorize(gateway, "booking-0001");
+        String second = authorize(gateway, "booking-0001");
 
         assertEquals(first, second);
         assertEquals(PaymentStatus.AUTHORIZED, gateway.status(first));
@@ -58,11 +58,11 @@ class PaymentGatewayContractTest {
     @MethodSource("profiles")
     void capturingTwiceNeverChargesTwice(Profile profile) {
         FakePaymentGateway gateway = profile.create().apply(clock);
-        String id = authorize(gateway, "booking-1");
-        gateway.capture(id);
+        String id = authorize(gateway, "booking-0001");
+        gateway.capture(id, 20_000);
 
         try {
-            gateway.capture(id);
+            gateway.capture(id, 20_000);
         } catch (PaymentRejectedException allowedByTheContract) {
             // Razorpay answers a second capture with BAD_REQUEST_ERROR; Stripe treats it as a no-op.
         }
@@ -75,11 +75,11 @@ class PaymentGatewayContractTest {
     @MethodSource("profiles")
     void refundingTwiceWithOneKeyRefundsOnce(Profile profile) {
         FakePaymentGateway gateway = profile.create().apply(clock);
-        String id = authorize(gateway, "booking-1");
-        gateway.capture(id);
+        String id = authorize(gateway, "booking-0001");
+        gateway.capture(id, 20_000);
 
-        gateway.refund("booking-1:cancel", id, 10_000);
-        gateway.refund("booking-1:cancel", id, 10_000);
+        gateway.refund("booking-0001_cancel", id, 10_000);
+        gateway.refund("booking-0001_cancel", id, 10_000);
 
         assertEquals(1, gateway.refunds().size());
     }
@@ -88,14 +88,14 @@ class PaymentGatewayContractTest {
     @MethodSource("profiles")
     void uncapturedAuthorizationIsReleasedExactlyAtExpiryAndCanNoLongerBeCaptured(Profile profile) {
         FakePaymentGateway gateway = profile.create().apply(clock);
-        String id = authorize(gateway, "booking-1");
+        String id = authorize(gateway, "booking-0001");
 
         clock.advance(profile.authorizationExpiry().minusNanos(1));
         assertEquals(PaymentStatus.AUTHORIZED, gateway.status(id));
 
         clock.advance(Duration.ofNanos(1));
         assertEquals(PaymentStatus.RELEASED, gateway.status(id));
-        assertThrows(PaymentRejectedException.class, () -> gateway.capture(id));
+        assertThrows(PaymentRejectedException.class, () -> gateway.capture(id, 20_000));
         assertEquals(0, gateway.captures().size());
     }
 
@@ -103,26 +103,48 @@ class PaymentGatewayContractTest {
     @MethodSource("profiles")
     void successfulVoidMeansTheAuthorizationCanNeverBeCaptured(Profile profile) {
         FakePaymentGateway gateway = profile.create().apply(clock);
-        String id = authorize(gateway, "booking-1");
+        String id = authorize(gateway, "booking-0001");
 
         if (gateway.tryVoid(id)) {
             assertEquals(PaymentStatus.RELEASED, gateway.status(id));
-            assertThrows(PaymentRejectedException.class, () -> gateway.capture(id));
+            assertThrows(PaymentRejectedException.class, () -> gateway.capture(id, 20_000));
         } else {
             assertEquals(PaymentStatus.AUTHORIZED, gateway.status(id));
         }
     }
 
+    @ParameterizedTest
+    @MethodSource("profiles")
+    void rejectsACaptureForADifferentAmountThanWasAuthorized(Profile profile) {
+        FakePaymentGateway gateway = profile.create().apply(clock);
+        String id = authorize(gateway, "booking-0001");
+
+        assertThrows(PaymentRejectedException.class, () -> gateway.capture(id, 19_999));
+        assertEquals(PaymentStatus.AUTHORIZED, gateway.status(id));
+    }
+
+    @ParameterizedTest
+    @MethodSource("profiles")
+    void rejectsIdempotencyKeysRazorpayWouldRefuse(Profile profile) {
+        FakePaymentGateway gateway = profile.create().apply(clock);
+        String id = authorize(gateway, "booking-0001");
+        gateway.capture(id, 20_000);
+
+        assertThrows(PaymentRejectedException.class, () -> gateway.refund("booking-0001:cancel", id, 10_000));
+        assertThrows(PaymentRejectedException.class, () -> gateway.refund("short", id, 10_000));
+        assertEquals(0, gateway.refunds().size());
+    }
+
     @Test
     void stripeCanVoid() {
         FakePaymentGateway gateway = FakePaymentGateway.stripe(clock);
-        assertTrue(gateway.tryVoid(authorize(gateway, "booking-1")));
+        assertTrue(gateway.tryVoid(authorize(gateway, "booking-0001")));
     }
 
     @Test
     void razorpayCannotVoid() {
         FakePaymentGateway gateway = FakePaymentGateway.razorpay(clock, RAZORPAY_EXPIRY);
-        String id = authorize(gateway, "booking-1");
+        String id = authorize(gateway, "booking-0001");
 
         assertFalse(gateway.tryVoid(id));
         assertEquals(PaymentStatus.AUTHORIZED, gateway.status(id));
@@ -131,9 +153,9 @@ class PaymentGatewayContractTest {
     @Test
     void razorpayRejectsASecondCapture() {
         FakePaymentGateway gateway = FakePaymentGateway.razorpay(clock, RAZORPAY_EXPIRY);
-        String id = authorize(gateway, "booking-1");
-        gateway.capture(id);
+        String id = authorize(gateway, "booking-0001");
+        gateway.capture(id, 20_000);
 
-        assertThrows(PaymentRejectedException.class, () -> gateway.capture(id));
+        assertThrows(PaymentRejectedException.class, () -> gateway.capture(id, 20_000));
     }
 }
