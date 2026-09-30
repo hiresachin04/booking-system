@@ -8,7 +8,8 @@ import booking.inventory.ShowInventory;
 import booking.model.Seat;
 import booking.model.Show;
 import booking.model.User;
-import booking.notify.BookingListener;
+import booking.notify.BookingEventType;
+import booking.notify.NotificationOutbox;
 import booking.payment.PaymentGateway;
 import booking.payment.PaymentResult;
 import booking.payment.PaymentStatus;
@@ -21,7 +22,6 @@ import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.UUID;
-import java.util.function.Consumer;
 
 public final class BookingService {
     private final ShowRepository shows;
@@ -31,10 +31,10 @@ public final class BookingService {
     private final RefundPolicy refundPolicy;
     private final BookingConfig config;
     private final Clock clock;
-    private final List<BookingListener> listeners;
+    private final NotificationOutbox outbox;
 
     public BookingService(ShowRepository shows, BookingRepository bookings, DiscountRegistry discounts, PaymentGateway payments,
-                          RefundPolicy refundPolicy, BookingConfig config, Clock clock, List<BookingListener> listeners) {
+                          RefundPolicy refundPolicy, BookingConfig config, Clock clock, NotificationOutbox outbox) {
         this.shows = Objects.requireNonNull(shows, "shows");
         this.bookings = Objects.requireNonNull(bookings, "bookings");
         this.discounts = Objects.requireNonNull(discounts, "discounts");
@@ -42,7 +42,7 @@ public final class BookingService {
         this.refundPolicy = Objects.requireNonNull(refundPolicy, "refundPolicy");
         this.config = Objects.requireNonNull(config, "config");
         this.clock = Objects.requireNonNull(clock, "clock");
-        this.listeners = List.copyOf(listeners);
+        this.outbox = Objects.requireNonNull(outbox, "outbox");
     }
 
     public Booking holdSeats(User user, String showId, List<String> seatIds) {
@@ -131,8 +131,9 @@ public final class BookingService {
                 if (booking.status() == BookingStatus.PAYMENT_FAILED) throw captureFailure;
             }
             if (booking.status() != BookingStatus.CONFIRMED) booking.markConfirmed(authorizationId);
+            // Recorded in the same step as the state change; delivery happens later and can't fail this call.
+            outbox.publish(BookingEventType.CONFIRMED, booking);
         }
-        notifyListeners(l -> l.onConfirmed(booking));
         return booking;
     }
 
@@ -160,8 +161,8 @@ public final class BookingService {
             if (refund > 0) payments.refund(paymentId, refund);
             inventory.cancel(booking.id(), booking.seatIds());
             booking.markCancelled(refund);
+            outbox.publish(BookingEventType.CANCELLED, booking);
         }
-        notifyListeners(l -> l.onCancelled(booking));
         return booking;
     }
 
@@ -183,7 +184,6 @@ public final class BookingService {
         RuntimeException failure = null;
         for (Booking booking : bookings.findByStatus(BookingStatus.PAYMENT_PENDING)) {
             ShowInventory inventory = inventoryOf(booking.show().id());
-            boolean confirmed;
             synchronized (booking) {
                 if (booking.status() != BookingStatus.PAYMENT_PENDING) continue;
                 try {
@@ -193,9 +193,8 @@ public final class BookingService {
                     else failure.addSuppressed(e);
                     continue;
                 }
-                confirmed = booking.status() == BookingStatus.CONFIRMED;
+                if (booking.status() == BookingStatus.CONFIRMED) outbox.publish(BookingEventType.CONFIRMED, booking);
             }
-            if (confirmed) notifyListeners(l -> l.onConfirmed(booking));
         }
         if (failure != null) throw failure;
     }
@@ -230,20 +229,6 @@ public final class BookingService {
         } catch (RuntimeException voidFailure) {
             primary.addSuppressed(voidFailure);
         }
-    }
-
-    // Every listener runs even if an earlier one throws; the first failure propagates with the rest suppressed.
-    private void notifyListeners(Consumer<BookingListener> event) {
-        RuntimeException failure = null;
-        for (BookingListener listener : listeners) {
-            try {
-                event.accept(listener);
-            } catch (RuntimeException e) {
-                if (failure == null) failure = e;
-                else failure.addSuppressed(e);
-            }
-        }
-        if (failure != null) throw failure;
     }
 
     // Someone else's booking reads as missing rather than forbidden, so booking ids can't be probed.

@@ -15,7 +15,7 @@ The draft `plan.md` in the repo describes a Spring Boot + DB REST app. You chose
 - `booking`: `Booking`, `BookingStatus` (State), `BookingService` (Facade).
 - `payment`: `PaymentGateway` (Strategy/port) and `PaymentResult`.
 - `discount`: `DiscountCode` and `DiscountRegistry`.
-- `notify`: `BookingListener` (Observer).
+- `notify`: `BookingListener` (Observer) and `NotificationOutbox` (Outbox).
 
 Money is always a `long` in paise. Percentages are `int` basis points. Time comes from an injected `java.time.Clock`.
 
@@ -52,7 +52,7 @@ class FlatDiscount     extends PriceDecorator    // -fixed paise, never below 0
 | State | `BookingStatus` enum with `canTransitionTo`: HELD→CONFIRMED/RELEASED/EXPIRED/PAYMENT_PENDING, PAYMENT_PENDING→CONFIRMED/PAYMENT_FAILED, CONFIRMED→CANCELLED | All illegal transitions are rejected in one place (`IllegalBookingStateException`). |
 | Strategy | `PaymentGateway`, `RefundPolicy` (tiered by hours before show) | Swappable. `FakePaymentGateway` in `test/` is the only fake, because payment is the process boundary. |
 | Facade | `BookingService`: `holdSeats`, `confirm`, `release`, `cancel` | Callers see one API. Inventory, pricing, payment, discounts and listeners stay behind it. |
-| Observer | `BookingListener` (`onConfirmed`, `onCancelled`) registered on `BookingService` | Booking code doesn't know notifications exist. If a listener throws, the exception propagates *after* the state change is committed. It is not swallowed. |
+| Observer + Outbox | `BookingListener` (`onConfirmed`, `onCancelled`) behind `NotificationOutbox` | `BookingService` only publishes an entry, in the same step as the state change, so a broken listener can't make a committed booking look failed. `dispatchDue()` (run on a schedule) delivers one entry per event per listener, retries with exponential backoff, and after `maxAttempts` parks the entry as `FAILED` with its last error. Retrying one listener never re-sends to another. |
 | Builder | `PriceQuoteBuilder` | Fixes the decorator order (see §1). |
 | Repository | In-memory `ShowRepository`, `BookingRepository` on `ConcurrentHashMap` | One concrete class each. No interface until a second implementation exists. |
 

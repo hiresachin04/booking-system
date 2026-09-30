@@ -9,6 +9,10 @@ import booking.inventory.SeatsUnavailableException;
 import booking.inventory.ShowInventory;
 import booking.model.User;
 import booking.notify.BookingListener;
+import booking.notify.DeliveryStatus;
+import booking.notify.NotificationOutbox;
+import booking.notify.OutboxEntry;
+import booking.notify.RetryPolicy;
 import booking.payment.PaymentStatus;
 import booking.pricing.Discount;
 import booking.support.FakePaymentGateway;
@@ -51,12 +55,7 @@ class BookingServiceTest {
     private final User alice = new User("u1", "Alice");
     private final User bob = new User("u2", "Bob");
 
-    private BookingService service(BookingListener... listeners) {
-        return new BookingService(shows, bookings, discounts, payments, refundPolicy,
-                new BookingConfig(TTL, MAX_SEATS, 1_000), clock, List.of(listeners));
-    }
-
-    private final BookingService service = service(new BookingListener() {
+    private final BookingListener recorder = new BookingListener() {
         @Override
         public void onConfirmed(Booking booking) {
             events.add("confirmed " + booking.id());
@@ -66,7 +65,20 @@ class BookingServiceTest {
         public void onCancelled(Booking booking) {
             events.add("cancelled " + booking.id());
         }
-    });
+    };
+
+    private BookingService service(NotificationOutbox outbox) {
+        return new BookingService(shows, bookings, discounts, payments, refundPolicy,
+                new BookingConfig(TTL, MAX_SEATS, 1_000), clock, outbox);
+    }
+
+    private final NotificationOutbox outbox = new NotificationOutbox(List.of(recorder), new RetryPolicy(3, Duration.ofSeconds(30)), clock);
+    private final BookingService service = service(outbox);
+
+    private List<String> deliveredEvents() {
+        outbox.dispatchDue();
+        return events;
+    }
 
     private DiscountCode code(String code, Discount discount, long minOrderPaise, int usageLimit) {
         DiscountCode dc = new DiscountCode(code, discount, NOW.minus(Duration.ofDays(1)), NOW.plus(Duration.ofDays(1)), minOrderPaise, usageLimit);
@@ -88,7 +100,7 @@ class BookingServiceTest {
         assertEquals(Optional.of("auth_1"), booking.paymentId());
         assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
         assertEquals(SeatStatus.BOOKED, inventory.status("B1"));
-        assertEquals(List.of("confirmed " + booking.id()), events);
+        assertEquals(List.of("confirmed " + booking.id()), deliveredEvents());
     }
 
     @Test
@@ -131,7 +143,7 @@ class BookingServiceTest {
         assertThrows(PaymentDeclinedException.class, () -> service.confirm(alice, booking.id()));
         assertEquals(BookingStatus.HELD, booking.status());
         assertThrows(SeatsUnavailableException.class, () -> service.holdSeats(bob, "sh", List.of("A1")));
-        assertEquals(List.of(), events);
+        assertEquals(List.of(), deliveredEvents());
 
         service.confirm(alice, booking.id());
         assertEquals(BookingStatus.CONFIRMED, booking.status());
@@ -149,7 +161,7 @@ class BookingServiceTest {
         assertEquals(List.of(), payments.captures());
         assertEquals(PaymentStatus.VOIDED, payments.state("auth_1"));
         assertEquals(SeatStatus.AVAILABLE, inventory.status("A1"));
-        assertEquals(List.of(), events);
+        assertEquals(List.of(), deliveredEvents());
     }
 
     @Test
@@ -195,7 +207,7 @@ class BookingServiceTest {
         assertEquals(PaymentStatus.VOIDED, payments.state("auth_1"));
         assertEquals(SeatStatus.AVAILABLE, inventory.status("A1"));
         assertEquals(List.of(), payments.captures());
-        assertEquals(List.of(), events);
+        assertEquals(List.of(), deliveredEvents());
         service.holdSeats(bob, "sh", List.of("A1"));
     }
 
@@ -209,7 +221,7 @@ class BookingServiceTest {
         assertEquals(BookingStatus.CONFIRMED, booking.status());
         assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
         assertEquals(1, payments.captures().size());
-        assertEquals(List.of("confirmed " + booking.id()), events);
+        assertEquals(List.of("confirmed " + booking.id()), deliveredEvents());
     }
 
     @Test
@@ -225,7 +237,7 @@ class BookingServiceTest {
         assertEquals(BookingStatus.PAYMENT_PENDING, booking.status());
         assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
         assertThrows(SeatsUnavailableException.class, () -> service.holdSeats(bob, "sh", List.of("A1")));
-        assertEquals(List.of(), events);
+        assertEquals(List.of(), deliveredEvents());
     }
 
     @Test
@@ -239,7 +251,7 @@ class BookingServiceTest {
 
         assertEquals(BookingStatus.CONFIRMED, booking.status());
         assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
-        assertEquals(List.of("confirmed " + booking.id()), events);
+        assertEquals(List.of("confirmed " + booking.id()), deliveredEvents());
     }
 
     @Test
@@ -257,7 +269,7 @@ class BookingServiceTest {
         assertEquals(PaymentStatus.VOIDED, payments.state("auth_1"));
         assertEquals(SeatStatus.AVAILABLE, inventory.status("A1"));
         assertEquals(0, dc.used());
-        assertEquals(List.of(), events);
+        assertEquals(List.of(), deliveredEvents());
     }
 
     @Test
@@ -513,7 +525,7 @@ class BookingServiceTest {
         assertEquals(10_000, booking.refundedPaise());
         assertEquals(List.of(new FakePaymentGateway.Refund("auth_1", 10_000)), payments.refunds());
         service.holdSeats(bob, "sh", List.of("A1"));
-        assertEquals(List.of("confirmed " + booking.id(), "cancelled " + booking.id()), events);
+        assertEquals(List.of("confirmed " + booking.id(), "cancelled " + booking.id()), deliveredEvents());
     }
 
     @Test
@@ -561,32 +573,36 @@ class BookingServiceTest {
         assertEquals(1, payments.refunds().size());
     }
 
-    // --- listeners ---
+    // --- notifications ---
 
     @Test
-    void throwingListenerPropagatesButTheBookingStaysConfirmedAndLaterListenersStillRun() {
+    void publishesTheEventWithoutDeliveringItInsideConfirm() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        service.confirm(alice, booking.id());
+
+        assertEquals(List.of(), events);
+        assertEquals(1, outbox.entries(DeliveryStatus.PENDING).size());
+    }
+
+    @Test
+    void failingListenerNoLongerMakesAConfirmedBookingLookFailed() {
         RuntimeException boom = new RuntimeException("mailer down");
-        List<String> reached = new ArrayList<>();
-        BookingService withFailingListener = service(
-                new BookingListener() {
-                    @Override
-                    public void onConfirmed(Booking booking) {
-                        throw boom;
-                    }
-                },
-                new BookingListener() {
-                    @Override
-                    public void onConfirmed(Booking booking) {
-                        reached.add(booking.id());
-                    }
-                });
-        Booking booking = withFailingListener.holdSeats(alice, "sh", List.of("A1"));
+        BookingListener broken = new BookingListener() {
+            @Override
+            public void onConfirmed(Booking booking) {
+                throw boom;
+            }
+        };
+        NotificationOutbox brokenOutbox = new NotificationOutbox(List.of(broken, recorder), new RetryPolicy(3, Duration.ofSeconds(30)), clock);
+        BookingService withBrokenListener = service(brokenOutbox);
+        Booking booking = withBrokenListener.holdSeats(alice, "sh", List.of("A1"));
 
-        RuntimeException thrown = assertThrows(RuntimeException.class, () -> withFailingListener.confirm(alice, booking.id()));
+        withBrokenListener.confirm(alice, booking.id());
+        brokenOutbox.dispatchDue();
 
-        assertSame(boom, thrown);
         assertEquals(BookingStatus.CONFIRMED, booking.status());
-        assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
-        assertEquals(List.of(booking.id()), reached);
+        assertEquals(List.of("confirmed " + booking.id()), events);
+        OutboxEntry retrying = brokenOutbox.entries(DeliveryStatus.PENDING).getFirst();
+        assertEquals(Optional.of(boom), retrying.lastError());
     }
 }
