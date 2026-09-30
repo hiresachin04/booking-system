@@ -7,6 +7,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.UUID;
 
 /**
  * Decouples notifications from the booking flow. {@link #publish} only records the event, so a broken listener
@@ -29,8 +30,9 @@ public final class NotificationOutbox {
 
     public void publish(BookingEventType type, Booking booking) {
         Instant now = clock.instant();
+        BookingEvent event = new BookingEvent(UUID.randomUUID().toString(), type, booking);
         synchronized (entries) {
-            for (BookingListener listener : listeners) entries.add(new OutboxEntry(type, booking, listener, now));
+            for (BookingListener listener : listeners) entries.add(new OutboxEntry(event, listener, now));
         }
     }
 

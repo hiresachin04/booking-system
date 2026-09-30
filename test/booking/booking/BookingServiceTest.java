@@ -8,6 +8,7 @@ import booking.inventory.SeatStatus;
 import booking.inventory.SeatsUnavailableException;
 import booking.inventory.ShowInventory;
 import booking.model.User;
+import booking.notify.BookingEvent;
 import booking.notify.BookingListener;
 import booking.notify.DeliveryStatus;
 import booking.notify.NotificationOutbox;
@@ -58,23 +59,23 @@ class BookingServiceTest {
 
     private final BookingListener recorder = new BookingListener() {
         @Override
-        public void onConfirmed(Booking booking) {
-            events.add("confirmed " + booking.id());
+        public void onConfirmed(BookingEvent event) {
+            events.add("confirmed " + event.booking().id());
         }
 
         @Override
-        public void onCancelled(Booking booking) {
-            events.add("cancelled " + booking.id());
+        public void onCancelled(BookingEvent event) {
+            events.add("cancelled " + event.booking().id());
         }
 
         @Override
-        public void onPaymentFailed(Booking booking) {
-            events.add("payment failed " + booking.id());
+        public void onPaymentFailed(BookingEvent event) {
+            events.add("payment failed " + event.booking().id());
         }
 
         @Override
-        public void onPaymentRefunded(Booking booking) {
-            events.add("refunded " + booking.id());
+        public void onPaymentRefunded(BookingEvent event) {
+            events.add("refunded " + event.booking().id());
         }
     };
 
@@ -722,7 +723,7 @@ class BookingServiceTest {
         RuntimeException boom = new RuntimeException("mailer down");
         BookingListener broken = new BookingListener() {
             @Override
-            public void onConfirmed(Booking booking) {
+            public void onConfirmed(BookingEvent event) {
                 throw boom;
             }
         };

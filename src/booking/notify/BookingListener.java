@@ -1,15 +1,14 @@
 package booking.notify;
 
-import booking.booking.Booking;
-
+/** Callbacks may be repeated for the same event; use {@link BookingEvent#id()} to make them idempotent. */
 public interface BookingListener {
-    default void onConfirmed(Booking booking) {}
+    default void onConfirmed(BookingEvent event) {}
 
-    default void onCancelled(Booking booking) {}
+    default void onCancelled(BookingEvent event) {}
 
     /** A payment that was left pending turned out not to go through; the customer holds no seats. */
-    default void onPaymentFailed(Booking booking) {}
+    default void onPaymentFailed(BookingEvent event) {}
 
     /** A pending payment was captured after its seats went back on sale, so it was refunded in full. */
-    default void onPaymentRefunded(Booking booking) {}
+    default void onPaymentRefunded(BookingEvent event) {}
 }

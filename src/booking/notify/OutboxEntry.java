@@ -1,34 +1,26 @@
 package booking.notify;
 
-import booking.booking.Booking;
-
 import java.time.Instant;
 import java.util.Objects;
 import java.util.Optional;
 
 /** One event for one listener, so a retry never re-sends to listeners that already got it. */
 public final class OutboxEntry {
-    private final BookingEventType type;
-    private final Booking booking;
+    private final BookingEvent event;
     private final BookingListener listener;
     private DeliveryStatus status = DeliveryStatus.PENDING;
     private int attempts;
     private Instant nextAttemptAt;
     private RuntimeException lastError;
 
-    OutboxEntry(BookingEventType type, Booking booking, BookingListener listener, Instant dueAt) {
-        this.type = Objects.requireNonNull(type, "type");
-        this.booking = Objects.requireNonNull(booking, "booking");
+    OutboxEntry(BookingEvent event, BookingListener listener, Instant dueAt) {
+        this.event = Objects.requireNonNull(event, "event");
         this.listener = Objects.requireNonNull(listener, "listener");
         this.nextAttemptAt = Objects.requireNonNull(dueAt, "dueAt");
     }
 
-    public BookingEventType type() {
-        return type;
-    }
-
-    public Booking booking() {
-        return booking;
+    public BookingEvent event() {
+        return event;
     }
 
     public synchronized DeliveryStatus status() {
@@ -52,11 +44,11 @@ public final class OutboxEntry {
     }
 
     void deliver() {
-        switch (type) {
-            case CONFIRMED -> listener.onConfirmed(booking);
-            case CANCELLED -> listener.onCancelled(booking);
-            case PAYMENT_FAILED -> listener.onPaymentFailed(booking);
-            case PAYMENT_REFUNDED -> listener.onPaymentRefunded(booking);
+        switch (event.type()) {
+            case CONFIRMED -> listener.onConfirmed(event);
+            case CANCELLED -> listener.onCancelled(event);
+            case PAYMENT_FAILED -> listener.onPaymentFailed(event);
+            case PAYMENT_REFUNDED -> listener.onPaymentRefunded(event);
         }
     }
 

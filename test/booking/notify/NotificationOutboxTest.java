@@ -16,10 +16,13 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 
 class NotificationOutboxTest {
@@ -43,19 +46,19 @@ class NotificationOutboxTest {
         }
 
         @Override
-        public void onConfirmed(Booking b) {
+        public void onConfirmed(BookingEvent e) {
             calls++;
             if (failuresLeft > 0) {
                 failuresLeft--;
                 throw error;
             }
-            delivered.add("confirmed " + b.id());
+            delivered.add("confirmed " + e.booking().id());
         }
 
         @Override
-        public void onCancelled(Booking b) {
+        public void onCancelled(BookingEvent e) {
             calls++;
-            delivered.add("cancelled " + b.id());
+            delivered.add("cancelled " + e.booking().id());
         }
     }
 
@@ -200,6 +203,86 @@ class NotificationOutboxTest {
         outbox.dispatchDue();
 
         assertEquals(List.of("confirmed " + booking.id()), sms.delivered);
+    }
+
+    /** Records the event id of every call, failing the first {@code failures} of them. */
+    private static final class IdRecorder implements BookingListener {
+        private final List<String> seenIds = new ArrayList<>();
+        private int failuresLeft;
+
+        IdRecorder(int failures) {
+            this.failuresLeft = failures;
+        }
+
+        @Override
+        public void onConfirmed(BookingEvent event) {
+            seenIds.add(event.id());
+            if (failuresLeft-- > 0) throw new RuntimeException("smtp 421");
+        }
+    }
+
+    @Test
+    void retriesCarryTheSameEventId() {
+        IdRecorder listener = new IdRecorder(1);
+        NotificationOutbox outbox = new NotificationOutbox(List.of(listener), RETRY, clock);
+        outbox.publish(BookingEventType.CONFIRMED, booking);
+
+        outbox.dispatchDue();
+        clock.advance(BACKOFF);
+        outbox.dispatchDue();
+
+        assertEquals(2, listener.seenIds.size());
+        assertEquals(listener.seenIds.get(0), listener.seenIds.get(1));
+    }
+
+    @Test
+    void everyPublishGetsItsOwnIdSharedByAllListeners() {
+        IdRecorder email = new IdRecorder(0);
+        IdRecorder sms = new IdRecorder(0);
+        NotificationOutbox outbox = new NotificationOutbox(List.of(email, sms), RETRY, clock);
+        outbox.publish(BookingEventType.CONFIRMED, booking);
+        outbox.publish(BookingEventType.CONFIRMED, booking);
+
+        outbox.dispatchDue();
+
+        assertEquals(email.seenIds, sms.seenIds);
+        assertNotEquals(email.seenIds.get(0), email.seenIds.get(1));
+    }
+
+    /** Stands in for an email API that dedupes on an idempotency key, as SES/SendGrid-style APIs do. */
+    private static final class FakeEmailProvider {
+        private final Set<String> seenKeys = new HashSet<>();
+        private final List<String> sent = new ArrayList<>();
+
+        void send(String idempotencyKey, String body) {
+            if (seenKeys.add(idempotencyKey)) sent.add(body);
+        }
+    }
+
+    @Test
+    void listenerKeyedOnEventIdSendsOneEmailEvenWhenItsSuccessWasReportedAsFailure() {
+        FakeEmailProvider provider = new FakeEmailProvider();
+        BookingListener emailer = new BookingListener() {
+            private boolean ackLost = true;
+
+            @Override
+            public void onConfirmed(BookingEvent event) {
+                provider.send(event.id(), "Booking " + event.booking().id() + " confirmed");
+                if (ackLost) {
+                    ackLost = false;
+                    throw new RuntimeException("email sent but response timed out");
+                }
+            }
+        };
+        NotificationOutbox outbox = new NotificationOutbox(List.of(emailer), RETRY, clock);
+        outbox.publish(BookingEventType.CONFIRMED, booking);
+
+        outbox.dispatchDue();
+        clock.advance(BACKOFF);
+        outbox.dispatchDue();
+
+        assertEquals(1, provider.sent.size());
+        assertEquals(1, outbox.entries(DeliveryStatus.SENT).size());
     }
 
     @Test
