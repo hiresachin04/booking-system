@@ -8,6 +8,15 @@
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />
+    <orderEntry type="module-library">
+      <library name="org.json">
+        <CLASSES>
+          <root url="jar://$MODULE_DIR$/lib/json-20260814.jar!/" />
+        </CLASSES>
+        <JAVADOC />
+        <SOURCES />
+      </library>
+    </orderEntry>
     <orderEntry type="module-library" scope="TEST">
       <library name="junit">
         <CLASSES>
