@@ -1,0 +1,425 @@
+package booking.booking;
+
+import booking.discount.DiscountCode;
+import booking.discount.DiscountRegistry;
+import booking.discount.DiscountRejectedException;
+import booking.inventory.HoldExpiredException;
+import booking.inventory.SeatStatus;
+import booking.inventory.SeatsUnavailableException;
+import booking.inventory.ShowInventory;
+import booking.model.User;
+import booking.notify.BookingListener;
+import booking.pricing.Discount;
+import booking.support.FakePaymentGateway;
+import booking.support.Fixtures;
+import booking.support.MutableClock;
+import booking.support.Race;
+import org.junit.jupiter.api.Test;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.NoSuchElementException;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
+class BookingServiceTest {
+    private static final Instant NOW = Instant.parse("2026-10-01T06:30:00Z");
+    // Thursday 20:00 in Kolkata, 8h after NOW: the 50% refund tier.
+    private static final Instant WEEKDAY_SHOW = NOW.plus(Duration.ofHours(8));
+    private static final Duration TTL = Duration.ofMinutes(10);
+    private static final int MAX_SEATS = 10;
+
+    private final MutableClock clock = new MutableClock(NOW);
+    private final ShowRepository shows = new ShowRepository(clock);
+    private final BookingRepository bookings = new BookingRepository();
+    private final DiscountRegistry discounts = new DiscountRegistry();
+    private final FakePaymentGateway payments = new FakePaymentGateway();
+    private final RefundPolicy refundPolicy = new TieredRefundPolicy(List.of(
+            new TieredRefundPolicy.Tier(Duration.ofHours(24), 10_000),
+            new TieredRefundPolicy.Tier(Duration.ofHours(4), 5_000)));
+    private final List<String> events = new ArrayList<>();
+    private final ShowInventory inventory = shows.add(Fixtures.show("sh", WEEKDAY_SHOW));
+
+    private final User alice = new User("u1", "Alice");
+    private final User bob = new User("u2", "Bob");
+
+    private BookingService service(BookingListener... listeners) {
+        return new BookingService(shows, bookings, discounts, payments, refundPolicy,
+                new BookingConfig(TTL, MAX_SEATS, 1_000), clock, List.of(listeners));
+    }
+
+    private final BookingService service = service(new BookingListener() {
+        @Override
+        public void onConfirmed(Booking booking) {
+            events.add("confirmed " + booking.id());
+        }
+
+        @Override
+        public void onCancelled(Booking booking) {
+            events.add("cancelled " + booking.id());
+        }
+    });
+
+    private DiscountCode code(String code, Discount discount, long minOrderPaise, int usageLimit) {
+        DiscountCode dc = new DiscountCode(code, discount, NOW.minus(Duration.ofDays(1)), NOW.plus(Duration.ofDays(1)), minOrderPaise, usageLimit);
+        discounts.add(dc);
+        return dc;
+    }
+
+    // --- hold & confirm ---
+
+    @Test
+    void confirmChargesTheQuotedAmountAndBooksTheSeats() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1", "B1"));
+        assertEquals(55_000, booking.price().totalPaise());
+
+        service.confirm(alice, booking.id());
+
+        assertEquals(BookingStatus.CONFIRMED, booking.status());
+        assertEquals(List.of(new FakePaymentGateway.Charge("ch_1", "u1", 55_000)), payments.charges());
+        assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
+        assertEquals(SeatStatus.BOOKED, inventory.status("B1"));
+        assertEquals(List.of("confirmed " + booking.id()), events);
+    }
+
+    @Test
+    void rejectsSecondUserHoldingASeatAlreadyHeld() {
+        service.holdSeats(alice, "sh", List.of("A1"));
+        assertThrows(SeatsUnavailableException.class, () -> service.holdSeats(bob, "sh", List.of("A1", "A2")));
+        assertEquals(List.of(), bookings.findByUser(bob));
+        assertEquals(SeatStatus.AVAILABLE, inventory.status("A2"));
+    }
+
+    @Test
+    void acceptsExactlyTheMaximumSeatCount() {
+        List<String> ten = List.of("A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "B1", "B2");
+        assertEquals(10, service.holdSeats(alice, "sh", ten).seatIds().size());
+    }
+
+    @Test
+    void rejectsMoreThanTheMaximumSeatCount() {
+        List<String> eleven = List.of("A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "B1", "B2", "B3");
+        assertThrows(IllegalArgumentException.class, () -> service.holdSeats(alice, "sh", eleven));
+        assertEquals(SeatStatus.AVAILABLE, inventory.status("A1"));
+    }
+
+    @Test
+    void rejectsHoldOnceTheShowHasStarted() {
+        clock.set(WEEKDAY_SHOW);
+        assertThrows(ShowAlreadyStartedException.class, () -> service.holdSeats(alice, "sh", List.of("A1")));
+    }
+
+    @Test
+    void rejectsHoldOnUnknownShow() {
+        assertThrows(NoSuchElementException.class, () -> service.holdSeats(alice, "nope", List.of("A1")));
+    }
+
+    @Test
+    void declinedPaymentKeepsTheBookingHeldSoTheCustomerCanRetry() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        payments.declineNext("insufficient funds");
+
+        assertThrows(PaymentDeclinedException.class, () -> service.confirm(alice, booking.id()));
+        assertEquals(BookingStatus.HELD, booking.status());
+        assertThrows(SeatsUnavailableException.class, () -> service.holdSeats(bob, "sh", List.of("A1")));
+        assertEquals(List.of(), events);
+
+        service.confirm(alice, booking.id());
+        assertEquals(BookingStatus.CONFIRMED, booking.status());
+        assertEquals(1, payments.charges().size());
+    }
+
+    @Test
+    void refundsInFullWhenTheHoldExpiresWhilePaymentIsInFlight() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        payments.duringCharge(() -> clock.advance(TTL));
+
+        assertThrows(HoldExpiredException.class, () -> service.confirm(alice, booking.id()));
+
+        assertEquals(BookingStatus.EXPIRED, booking.status());
+        assertEquals(List.of(new FakePaymentGateway.Refund("ch_1", 20_000)), payments.refunds());
+        assertEquals(SeatStatus.AVAILABLE, inventory.status("A1"));
+        assertEquals(List.of(), events);
+    }
+
+    @Test
+    void refundsWhenSomeoneElseTookTheSeatWhilePaymentWasInFlight() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        payments.duringCharge(() -> {
+            clock.advance(TTL);
+            service.holdSeats(bob, "sh", List.of("A1"));
+        });
+
+        assertThrows(HoldExpiredException.class, () -> service.confirm(alice, booking.id()));
+
+        assertEquals(1, payments.refunds().size());
+        assertEquals(SeatStatus.HELD, inventory.status("A1"));
+    }
+
+    @Test
+    void rejectsConfirmAfterExpiryWithoutCharging() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        clock.advance(TTL);
+
+        assertThrows(HoldExpiredException.class, () -> service.confirm(alice, booking.id()));
+        assertEquals(BookingStatus.EXPIRED, booking.status());
+        assertEquals(List.of(), payments.charges());
+    }
+
+    @Test
+    void rejectsConfirmingTwice() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        service.confirm(alice, booking.id());
+
+        assertThrows(IllegalBookingStateException.class, () -> service.confirm(alice, booking.id()));
+        assertEquals(1, payments.charges().size());
+    }
+
+    @Test
+    void secondConfirmArrivingMidPaymentWaitsAndIsRejected() throws Exception {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        AtomicReference<Throwable> secondOutcome = new AtomicReference<>();
+        Thread second = new Thread(() -> {
+            try {
+                service.confirm(alice, booking.id());
+            } catch (Throwable t) {
+                secondOutcome.set(t);
+            }
+        });
+        // Start the second confirm while the first is inside charge(), and wait until it is parked on a monitor.
+        payments.duringCharge(() -> {
+            second.start();
+            awaitBlocked(second);
+        });
+
+        service.confirm(alice, booking.id());
+        second.join(5_000);
+
+        assertInstanceOf(IllegalBookingStateException.class, secondOutcome.get());
+        // Idempotency would hide a second charge here; the booking lock must stop the request reaching the gateway.
+        assertEquals(1, payments.chargeAttempts());
+        assertEquals(List.of(), payments.refunds());
+        assertEquals(BookingStatus.CONFIRMED, booking.status());
+    }
+
+    private static void awaitBlocked(Thread thread) {
+        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (thread.getState() != Thread.State.BLOCKED) {
+            if (System.nanoTime() > deadline) throw new AssertionError("thread never blocked: " + thread.getState());
+            Thread.onSpinWait();
+        }
+    }
+
+    @Test
+    void concurrentUsersRacingForOneSeatProduceOneBooking() {
+        List<User> users = new ArrayList<>();
+        for (int i = 0; i < 20; i++) users.add(new User("racer" + i, "Racer " + i));
+        List<Boolean> outcomes = Race.run(users.size(), i -> {
+            try {
+                Booking b = service.holdSeats(users.get(i), "sh", List.of("B1"));
+                service.confirm(users.get(i), b.id());
+                return true;
+            } catch (SeatsUnavailableException e) {
+                return false;
+            }
+        });
+        assertEquals(1, Race.winners(outcomes));
+        assertEquals(1, payments.charges().size());
+    }
+
+    @Test
+    void hidesAnotherUsersBookingAsMissing() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        assertThrows(NoSuchElementException.class, () -> service.confirm(bob, booking.id()));
+        assertThrows(NoSuchElementException.class, () -> service.release(bob, booking.id()));
+        assertEquals(BookingStatus.HELD, booking.status());
+    }
+
+    @Test
+    void releaseFreesTheSeatsForOthers() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        service.release(alice, booking.id());
+
+        assertEquals(BookingStatus.RELEASED, booking.status());
+        service.holdSeats(bob, "sh", List.of("A1"));
+        assertThrows(IllegalBookingStateException.class, () -> service.confirm(alice, booking.id()));
+    }
+
+    // --- discounts ---
+
+    @Test
+    void appliesDiscountCodeToTheQuoteAndConsumesAUseOnConfirm() {
+        DiscountCode dc = code("FLAT50", new Discount.Flat(5_000), 0, 5);
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"), "FLAT50");
+        assertEquals(15_000, booking.price().totalPaise());
+        assertEquals(0, dc.used());
+
+        service.confirm(alice, booking.id());
+        assertEquals(1, dc.used());
+        assertEquals(15_000, payments.charges().getFirst().amountPaise());
+    }
+
+    @Test
+    void rejectsUnknownDiscountCode() {
+        assertThrows(DiscountRejectedException.class, () -> service.holdSeats(alice, "sh", List.of("A1"), "NOPE"));
+        assertEquals(SeatStatus.AVAILABLE, inventory.status("A1"));
+    }
+
+    @Test
+    void rejectsExpiredDiscountCodeAtHold() {
+        discounts.add(new DiscountCode("OLD", new Discount.Flat(5_000), NOW.minus(Duration.ofDays(2)), NOW, 0, 5));
+        assertThrows(DiscountRejectedException.class, () -> service.holdSeats(alice, "sh", List.of("A1"), "OLD"));
+    }
+
+    @Test
+    void rejectsDiscountCodeWhenOrderIsOnePaiseBelowMinimum() {
+        code("MIN", new Discount.Flat(5_000), 20_001, 5);
+        assertThrows(DiscountRejectedException.class, () -> service.holdSeats(alice, "sh", List.of("A1"), "MIN"));
+    }
+
+    @Test
+    void acceptsDiscountCodeWhenOrderExactlyMeetsMinimum() {
+        code("MIN", new Discount.Flat(5_000), 20_000, 5);
+        assertEquals(15_000, service.holdSeats(alice, "sh", List.of("A1"), "MIN").price().totalPaise());
+    }
+
+    @Test
+    void onlyOneOfTwoConfirmsGetsTheLastDiscountUse() {
+        DiscountCode dc = code("LAST", new Discount.Flat(5_000), 0, 1);
+        Booking a = service.holdSeats(alice, "sh", List.of("A1"), "LAST");
+        Booking b = service.holdSeats(bob, "sh", List.of("A2"), "LAST");
+        List<Booking> both = List.of(a, b);
+        List<User> owners = List.of(alice, bob);
+
+        List<Boolean> outcomes = Race.run(2, i -> {
+            try {
+                service.confirm(owners.get(i), both.get(i).id());
+                return true;
+            } catch (DiscountRejectedException e) {
+                return false;
+            }
+        });
+
+        assertEquals(1, Race.winners(outcomes));
+        assertEquals(1, dc.used());
+        assertEquals(1, payments.charges().size());
+        Booking loser = outcomes.get(0) ? b : a;
+        assertEquals(BookingStatus.HELD, loser.status());
+    }
+
+    @Test
+    void declinedPaymentGivesTheDiscountUseBack() {
+        DiscountCode dc = code("ONE", new Discount.Flat(5_000), 0, 1);
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"), "ONE");
+        payments.declineNext("card expired");
+
+        assertThrows(PaymentDeclinedException.class, () -> service.confirm(alice, booking.id()));
+        assertEquals(0, dc.used());
+    }
+
+    @Test
+    void expiryDuringPaymentGivesTheDiscountUseBack() {
+        DiscountCode dc = code("ONE", new Discount.Flat(5_000), 0, 1);
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"), "ONE");
+        payments.duringCharge(() -> clock.advance(TTL));
+
+        assertThrows(HoldExpiredException.class, () -> service.confirm(alice, booking.id()));
+        assertEquals(0, dc.used());
+    }
+
+    // --- cancel & refund ---
+
+    @Test
+    void cancelRefundsPerPolicyAndFreesTheSeats() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        service.confirm(alice, booking.id());
+
+        service.cancel(alice, booking.id());
+
+        assertEquals(BookingStatus.CANCELLED, booking.status());
+        assertEquals(10_000, booking.refundedPaise());
+        assertEquals(List.of(new FakePaymentGateway.Refund("ch_1", 10_000)), payments.refunds());
+        service.holdSeats(bob, "sh", List.of("A1"));
+        assertEquals(List.of("confirmed " + booking.id(), "cancelled " + booking.id()), events);
+    }
+
+    @Test
+    void cancelWithExactlyFourHoursNoticeStillGetsTheHalfRefund() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        service.confirm(alice, booking.id());
+        clock.set(WEEKDAY_SHOW.minus(Duration.ofHours(4)));
+        assertEquals(10_000, service.cancel(alice, booking.id()).refundedPaise());
+    }
+
+    @Test
+    void cancelJustUnderFourHoursBeforeShowRefundsNothing() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        service.confirm(alice, booking.id());
+        clock.set(WEEKDAY_SHOW.minus(Duration.ofHours(4)).plusNanos(1));
+
+        service.cancel(alice, booking.id());
+        assertEquals(0, booking.refundedPaise());
+        assertEquals(List.of(), payments.refunds());
+    }
+
+    @Test
+    void rejectsCancelOnceTheShowHasStarted() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        service.confirm(alice, booking.id());
+        clock.set(WEEKDAY_SHOW);
+
+        assertThrows(ShowAlreadyStartedException.class, () -> service.cancel(alice, booking.id()));
+        assertEquals(BookingStatus.CONFIRMED, booking.status());
+    }
+
+    @Test
+    void rejectsCancelOfABookingThatWasNeverConfirmed() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        assertThrows(IllegalBookingStateException.class, () -> service.cancel(alice, booking.id()));
+        assertEquals(SeatStatus.HELD, inventory.status("A1"));
+    }
+
+    @Test
+    void rejectsCancellingTwice() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        service.confirm(alice, booking.id());
+        service.cancel(alice, booking.id());
+        assertThrows(IllegalBookingStateException.class, () -> service.cancel(alice, booking.id()));
+        assertEquals(1, payments.refunds().size());
+    }
+
+    // --- listeners ---
+
+    @Test
+    void throwingListenerPropagatesButTheBookingStaysConfirmedAndLaterListenersStillRun() {
+        RuntimeException boom = new RuntimeException("mailer down");
+        List<String> reached = new ArrayList<>();
+        BookingService withFailingListener = service(
+                new BookingListener() {
+                    @Override
+                    public void onConfirmed(Booking booking) {
+                        throw boom;
+                    }
+                },
+                new BookingListener() {
+                    @Override
+                    public void onConfirmed(Booking booking) {
+                        reached.add(booking.id());
+                    }
+                });
+        Booking booking = withFailingListener.holdSeats(alice, "sh", List.of("A1"));
+
+        RuntimeException thrown = assertThrows(RuntimeException.class, () -> withFailingListener.confirm(alice, booking.id()));
+
+        assertSame(boom, thrown);
+        assertEquals(BookingStatus.CONFIRMED, booking.status());
+        assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
+        assertEquals(List.of(booking.id()), reached);
+    }
+}
