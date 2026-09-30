@@ -4,6 +4,7 @@ import booking.discount.DiscountCode;
 import booking.model.Show;
 import booking.model.User;
 import booking.pricing.PriceComponent;
+import booking.retry.RetryPolicy;
 
 import java.time.Instant;
 import java.util.List;
@@ -22,6 +23,9 @@ public final class Booking {
     private BookingStatus status = BookingStatus.HELD;
     private String paymentId;
     private Instant paymentPendingSince;
+    private int captureAttempts;
+    private Instant nextCaptureAt;
+    private boolean captureGivenUp;
     private long refundedPaise;
 
     Booking(String id, User user, Show show, List<String> seatIds, PriceComponent price, Instant holdExpiresAt, DiscountCode discountCode) {
@@ -93,6 +97,21 @@ public final class Booking {
     synchronized Instant paymentPendingSince() {
         if (paymentPendingSince == null) throw new IllegalStateException("booking " + id + " never went pending");
         return paymentPendingSince;
+    }
+
+    /** A permanent rejection, or running out of attempts, stops the retries; otherwise the next one is scheduled. */
+    synchronized void recordFailedCapture(Instant now, boolean permanent, RetryPolicy retry) {
+        captureAttempts++;
+        if (permanent || captureAttempts >= retry.maxAttempts()) captureGivenUp = true;
+        else nextCaptureAt = now.plus(retry.backoffAfter(captureAttempts));
+    }
+
+    synchronized boolean isCaptureDue(Instant now) {
+        return !captureGivenUp && nextCaptureAt != null && !now.isBefore(nextCaptureAt);
+    }
+
+    synchronized boolean captureGivenUp() {
+        return captureGivenUp;
     }
 
     synchronized void markPaymentUnresolved() {

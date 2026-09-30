@@ -42,7 +42,7 @@ class BookingSystemTest {
         }
     };
     private final BookingSystem system = BookingSystem.start(new BookingSystem.Settings(
-                    new BookingConfig(Duration.ofMinutes(10), 10, 0, Duration.ofMinutes(15)),
+                    new BookingConfig(Duration.ofMinutes(10), 10, 0, Duration.ofMinutes(15), BookingConfig.DEFAULT_CAPTURE_RETRY),
                     new TieredRefundPolicy(List.of()), new RetryPolicy(3, TICK), Duration.ofDays(1), TICK, TICK, WAIT),
             payments, List.of(recorder), clock);
     private final User alice = new User("u1", "Alice");
@@ -93,6 +93,15 @@ class BookingSystemTest {
 
         awaitTrue(() -> booking.status() == BookingStatus.CONFIRMED, "reconciliation after outage");
         assertTrue(system.jobs().reconcile().runs() >= 4);
+    }
+
+    @Test
+    void defaultSettingsReconcileEveryThirtySeconds() {
+        BookingSystem.Settings defaults = BookingSystem.Settings.withDefaults(
+                new BookingConfig(Duration.ofMinutes(10), 10, 0, Duration.ofMinutes(15), BookingConfig.DEFAULT_CAPTURE_RETRY),
+                new TieredRefundPolicy(List.of()));
+        assertEquals(Duration.ofSeconds(30), defaults.reconcileEvery());
+        assertEquals(3, BookingConfig.DEFAULT_CAPTURE_RETRY.maxAttempts());
     }
 
     @Test

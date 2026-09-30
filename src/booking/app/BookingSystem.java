@@ -35,6 +35,15 @@ public final class BookingSystem implements AutoCloseable {
             Objects.requireNonNull(reconcileEvery, "reconcileEvery");
             Objects.requireNonNull(shutdownGrace, "shutdownGrace");
         }
+
+        /**
+         * Reconciliation runs every 30s. Each booking's capture retries have their own backoff, so a frequent run
+         * doesn't mean a capture attempt every run: a retry lands up to one interval after it falls due.
+         */
+        public static Settings withDefaults(BookingConfig booking, RefundPolicy refundPolicy) {
+            return new Settings(booking, refundPolicy, new RetryPolicy(5, Duration.ofSeconds(30)), Duration.ofDays(7),
+                    Duration.ofSeconds(5), Duration.ofSeconds(30), Duration.ofSeconds(10));
+        }
     }
 
     private static final int JOB_THREADS = 2;

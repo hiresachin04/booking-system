@@ -14,6 +14,7 @@ import booking.notify.DeliveryStatus;
 import booking.notify.NotificationOutbox;
 import booking.notify.OutboxEntry;
 import booking.retry.RetryPolicy;
+import booking.payment.PaymentRejectedException;
 import booking.payment.PaymentStatus;
 import booking.pricing.Discount;
 import booking.support.FakePaymentGateway;
@@ -42,6 +43,7 @@ class BookingServiceTest {
     private static final Duration TTL = Duration.ofMinutes(10);
     private static final int MAX_SEATS = 10;
     private static final Duration MAX_PENDING = Duration.ofMinutes(15);
+    private static final RetryPolicy CAPTURE_RETRY = new RetryPolicy(3, Duration.ofSeconds(30));
 
     private final MutableClock clock = new MutableClock(NOW);
     private final ShowRepository shows = new ShowRepository(clock);
@@ -81,7 +83,7 @@ class BookingServiceTest {
 
     private BookingService service(NotificationOutbox outbox) {
         return new BookingService(shows, bookings, discounts, payments, refundPolicy,
-                new BookingConfig(TTL, MAX_SEATS, 1_000, MAX_PENDING), clock, outbox);
+                new BookingConfig(TTL, MAX_SEATS, 1_000, MAX_PENDING, CAPTURE_RETRY), clock, outbox);
     }
 
     private final NotificationOutbox outbox = new NotificationOutbox(List.of(recorder), new RetryPolicy(3, Duration.ofSeconds(30)), Duration.ofDays(30), clock);
@@ -171,7 +173,7 @@ class BookingServiceTest {
 
         assertEquals(BookingStatus.EXPIRED, booking.status());
         assertEquals(List.of(), payments.captures());
-        assertEquals(PaymentStatus.VOIDED, payments.state("auth_1"));
+        assertEquals(PaymentStatus.RELEASED, payments.state("auth_1"));
         assertEquals(SeatStatus.AVAILABLE, inventory.status("A1"));
         assertEquals(List.of(), deliveredEvents());
     }
@@ -187,7 +189,7 @@ class BookingServiceTest {
         assertThrows(HoldExpiredException.class, () -> service.confirm(alice, booking.id()));
 
         assertEquals(List.of(), payments.captures());
-        assertEquals(PaymentStatus.VOIDED, payments.state("auth_1"));
+        assertEquals(PaymentStatus.RELEASED, payments.state("auth_1"));
         assertEquals(SeatStatus.HELD, inventory.status("A1"));
     }
 
@@ -207,20 +209,130 @@ class BookingServiceTest {
     }
 
     @Test
-    void failedCaptureGivesTheSeatsBackAndVoidsTheAuthorization() {
-        RuntimeException captureFailure = new RuntimeException("processor unavailable");
+    void failedCaptureKeepsTheSeatsAndRetriesExactlyWhenTheBackoffEnds() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
-        payments.failNextCapture(captureFailure);
+        payments.failCaptures(1);
+
+        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
+        assertEquals(BookingStatus.PAYMENT_PENDING, booking.status());
+        assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
+
+        clock.advance(CAPTURE_RETRY.initialBackoff().minusNanos(1));
+        service.reconcilePendingPayments();
+        assertEquals(1, payments.captureAttempts());
+
+        clock.advance(Duration.ofNanos(1));
+        service.reconcilePendingPayments();
+        assertEquals(2, payments.captureAttempts());
+        assertEquals(BookingStatus.CONFIRMED, booking.status());
+        assertEquals(1, payments.captures().size());
+        assertEquals(List.of("confirmed " + booking.id()), deliveredEvents());
+    }
+
+    @Test
+    void secondRetryWaitsTwiceAsLongAsTheFirst() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        payments.failCaptures(2);
+        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
+        clock.advance(Duration.ofSeconds(30));
+        service.reconcilePendingPayments();
+
+        clock.advance(Duration.ofSeconds(60).minusNanos(1));
+        service.reconcilePendingPayments();
+        assertEquals(2, payments.captureAttempts());
+
+        clock.advance(Duration.ofNanos(1));
+        service.reconcilePendingPayments();
+        assertEquals(3, payments.captureAttempts());
+        assertEquals(BookingStatus.CONFIRMED, booking.status());
+    }
+
+    @Test
+    void givesUpAfterThreeAttemptsThenReleasesTheSeatsAndVoids() {
+        DiscountCode dc = code("ONE", new Discount.Flat(5_000), 0, 1);
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"), "ONE");
+        payments.failCaptures(3);
+        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
+        clock.advance(Duration.ofSeconds(30));
+        assertEquals(List.of(), service.reconcilePendingPayments().seatsReleasedBookingIds());
+        clock.advance(Duration.ofSeconds(60));
+
+        ReconciliationReport lastAttempt = service.reconcilePendingPayments();
+
+        assertEquals(3, payments.captureAttempts());
+        assertEquals(List.of(booking.id()), lastAttempt.seatsReleasedBookingIds());
+        assertEquals(BookingStatus.PAYMENT_UNRESOLVED, booking.status());
+        assertEquals(SeatStatus.AVAILABLE, inventory.status("A1"));
+        service.holdSeats(bob, "sh", List.of("A2"));
+
+        service.reconcilePendingPayments();
+        assertEquals(BookingStatus.PAYMENT_FAILED, booking.status());
+        assertEquals(PaymentStatus.RELEASED, payments.state("auth_1"));
+        assertEquals(3, payments.captureAttempts());
+        assertEquals(0, dc.used());
+        assertEquals(List.of("payment failed " + booking.id()), deliveredEvents());
+    }
+
+    @Test
+    void rejectedCaptureStopsRetryingAndReleasesTheSeatsAtOnce() {
+        PaymentRejectedException rejected = new PaymentRejectedException("BAD_REQUEST_ERROR");
+        DiscountCode dc = code("ONE", new Discount.Flat(5_000), 0, 1);
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"), "ONE");
+        payments.failNextCapture(rejected);
 
         RuntimeException thrown = assertThrows(RuntimeException.class, () -> service.confirm(alice, booking.id()));
 
-        assertSame(captureFailure, thrown);
-        assertEquals(BookingStatus.PAYMENT_FAILED, booking.status());
-        assertEquals(PaymentStatus.VOIDED, payments.state("auth_1"));
+        assertSame(rejected, thrown);
+        assertEquals(BookingStatus.PAYMENT_UNRESOLVED, booking.status());
         assertEquals(SeatStatus.AVAILABLE, inventory.status("A1"));
-        assertEquals(List.of(), payments.captures());
-        assertEquals(List.of(), deliveredEvents());
-        service.holdSeats(bob, "sh", List.of("A1"));
+
+        clock.advance(Duration.ofHours(1));
+        service.reconcilePendingPayments();
+        assertEquals(1, payments.captureAttempts());
+        assertEquals(BookingStatus.PAYMENT_FAILED, booking.status());
+        assertEquals(0, dc.used());
+    }
+
+    @Test
+    void rejectionThatMeansAlreadyCapturedStillConfirms() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        payments.loseNextCaptureResponse(new PaymentRejectedException("payment has already been captured"));
+
+        service.confirm(alice, booking.id());
+
+        assertEquals(BookingStatus.CONFIRMED, booking.status());
+        assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
+    }
+
+    @Test
+    void retriedCaptureRejectedAsAlreadyCapturedStillConfirms() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        payments.failCaptures(1);
+        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
+        payments.loseNextCaptureResponse(new PaymentRejectedException("payment has already been captured"));
+        clock.advance(Duration.ofSeconds(30));
+
+        service.reconcilePendingPayments();
+
+        assertEquals(BookingStatus.CONFIRMED, booking.status());
+        assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
+    }
+
+    @Test
+    void failedVoidAfterReleasingTheSeatsIsRetriedOnTheNextRun() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        payments.failNextCapture(new PaymentRejectedException("BAD_REQUEST_ERROR"));
+        assertThrows(PaymentRejectedException.class, () -> service.confirm(alice, booking.id()));
+        payments.failNextVoid(new RuntimeException("void timed out"));
+
+        ReconciliationReport failed = service.reconcilePendingPayments();
+        assertEquals(1, failed.failures().size());
+        assertEquals(BookingStatus.PAYMENT_UNRESOLVED, booking.status());
+        assertEquals(PaymentStatus.AUTHORIZED, payments.state("auth_1"));
+
+        service.reconcilePendingPayments();
+        assertEquals(BookingStatus.PAYMENT_FAILED, booking.status());
+        assertEquals(PaymentStatus.RELEASED, payments.state("auth_1"));
     }
 
     @Test
@@ -264,40 +376,6 @@ class BookingServiceTest {
         assertEquals(BookingStatus.CONFIRMED, booking.status());
         assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
         assertEquals(List.of("confirmed " + booking.id()), deliveredEvents());
-    }
-
-    @Test
-    void reconciliationVoidsAndFreesSeatsWhenTheProcessorNeverCaptured() {
-        DiscountCode dc = code("ONE", new Discount.Flat(5_000), 0, 1);
-        Booking booking = service.holdSeats(alice, "sh", List.of("A1"), "ONE");
-        payments.failNextCapture(new RuntimeException("connection reset"));
-        payments.failStatusLookups(1);
-        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
-        assertEquals(1, dc.used());
-
-        service.reconcilePendingPayments();
-
-        assertEquals(BookingStatus.PAYMENT_FAILED, booking.status());
-        assertEquals(PaymentStatus.VOIDED, payments.state("auth_1"));
-        assertEquals(SeatStatus.AVAILABLE, inventory.status("A1"));
-        assertEquals(0, dc.used());
-        assertEquals(List.of("payment failed " + booking.id()), deliveredEvents());
-    }
-
-    @Test
-    void staysPendingWhenTheVoidFailsSoALateCaptureCannotLandOnFreedSeats() {
-        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
-        payments.failNextCapture(new RuntimeException("connection reset"));
-        payments.failNextVoid(new RuntimeException("void timed out"));
-
-        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
-        assertEquals(BookingStatus.PAYMENT_PENDING, booking.status());
-        assertEquals(PaymentStatus.AUTHORIZED, payments.state("auth_1"));
-        assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
-
-        service.reconcilePendingPayments();
-        assertEquals(BookingStatus.PAYMENT_FAILED, booking.status());
-        assertEquals(SeatStatus.AVAILABLE, inventory.status("A1"));
     }
 
     @Test
@@ -417,7 +495,7 @@ class BookingServiceTest {
         service.reconcilePendingPayments();
 
         assertEquals(BookingStatus.PAYMENT_FAILED, booking.status());
-        assertEquals(PaymentStatus.VOIDED, payments.state("auth_1"));
+        assertEquals(PaymentStatus.RELEASED, payments.state("auth_1"));
         assertEquals(List.of(), payments.refunds());
         service.confirm(bob, resold.id());
         assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
@@ -463,16 +541,6 @@ class BookingServiceTest {
 
         assertThrows(IllegalBookingStateException.class, () -> service.cancel(alice, booking.id()));
         assertEquals(List.of(), payments.refunds());
-    }
-
-    @Test
-    void failedCaptureGivesTheDiscountUseBack() {
-        DiscountCode dc = code("ONE", new Discount.Flat(5_000), 0, 1);
-        Booking booking = service.holdSeats(alice, "sh", List.of("A1"), "ONE");
-        payments.failNextCapture(new RuntimeException("processor unavailable"));
-
-        assertThrows(RuntimeException.class, () -> service.confirm(alice, booking.id()));
-        assertEquals(0, dc.used());
     }
 
     @Test
