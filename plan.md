@@ -16,6 +16,7 @@ The draft `plan.md` in the repo describes a Spring Boot + DB REST app. You chose
 - `payment`: `PaymentGateway` (Strategy/port) and `PaymentResult`.
 - `discount`: `DiscountCode` and `DiscountRegistry`.
 - `notify`: `BookingListener` (Observer) and `NotificationOutbox` (Outbox).
+- `app`: `BookingSystem` (composition root) and `BackgroundJobs`, which runs `dispatchDue()` and `reconcilePendingPayments()` on a scheduler. Each job is wrapped in a `ScheduledJob`, so a failing run is recorded rather than silently cancelling the schedule.
 
 Money is always a `long` in paise. Percentages are `int` basis points. Time comes from an injected `java.time.Clock`.
 
@@ -74,3 +75,10 @@ Discount codes: each code has a validity window, a minimum order, and a total us
 ## Verification
 - `./test.sh` runs the full suite. Use `./test.sh --select-class booking.inventory.ShowInventoryTest` while iterating on the concurrency work.
 - The concurrency tests loop the race (e.g. 200 iterations) to rule out a lucky pass. Mutation check before finishing: remove the lock in `ShowInventory.hold` and confirm the race test fails.
+
+## Known limitations
+- **All state is in memory.** Bookings, seat inventory, the outbox and pending payments are lost on restart. Persisting only the outbox wouldn't help, because the bookings its entries refer to would be gone too. The real fix is a database: write the outbox row in the same transaction as the booking change, and run the dispatcher and reconciler against the tables (`SELECT … FOR UPDATE SKIP LOCKED` if several instances run).
+- **No `main`.** `BookingSystem` is the composition root, but it takes the `PaymentGateway` and listeners as parameters. A runnable app needs a real processor adapter (e.g. Razorpay/Stripe), which is a dependency decision still to make.
+- **Duplicate notifications are only prevented on the receiving side.** Delivery is at-least-once, and each `BookingEvent.id()` is stable across retries. Listeners must pass it to their provider as the idempotency key.
+- **FAILED outbox entries are kept until someone deals with them.** There is no requeue or discard operation yet.
+
