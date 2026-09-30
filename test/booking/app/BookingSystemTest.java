@@ -47,6 +47,10 @@ class BookingSystemTest {
             payments, List.of(recorder), clock);
     private final User alice = new User("u1", "Alice");
 
+    private Booking confirm(User user, Booking booking) {
+        return system.bookingService().confirm(user, booking.id(), payments.simulateCheckout(booking.checkout()));
+    }
+
     @AfterEach
     void stop() {
         system.close();
@@ -65,7 +69,7 @@ class BookingSystemTest {
         system.shows().add(Fixtures.show("sh", NOW.plus(Duration.ofHours(8))));
         Booking booking = system.bookingService().holdSeats(alice, "sh", List.of("A1"));
 
-        system.bookingService().confirm(alice, booking.id());
+        confirm(alice, booking);
 
         awaitTrue(() -> !delivered.isEmpty(), "scheduled dispatch");
         assertEquals(List.of("confirmed " + booking.id()), delivered);
@@ -77,7 +81,7 @@ class BookingSystemTest {
         Booking booking = system.bookingService().holdSeats(alice, "sh", List.of("A1"));
         payments.loseNextCaptureResponse(new RuntimeException("read timeout"));
         payments.failStatusLookups(1);
-        assertThrows(PaymentPendingException.class, () -> system.bookingService().confirm(alice, booking.id()));
+        assertThrows(PaymentPendingException.class, () -> confirm(alice, booking));
 
         awaitTrue(() -> booking.status() == BookingStatus.CONFIRMED, "scheduled reconciliation");
         awaitTrue(() -> !delivered.isEmpty(), "confirmation after reconciliation");
@@ -89,7 +93,7 @@ class BookingSystemTest {
         Booking booking = system.bookingService().holdSeats(alice, "sh", List.of("A1"));
         payments.loseNextCaptureResponse(new RuntimeException("read timeout"));
         payments.failStatusLookups(4);
-        assertThrows(PaymentPendingException.class, () -> system.bookingService().confirm(alice, booking.id()));
+        assertThrows(PaymentPendingException.class, () -> confirm(alice, booking));
 
         awaitTrue(() -> booking.status() == BookingStatus.CONFIRMED, "reconciliation after outage");
         assertTrue(system.jobs().reconcile().runs() >= 4);

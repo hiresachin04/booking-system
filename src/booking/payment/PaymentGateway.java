@@ -6,8 +6,19 @@ package booking.payment;
  * {@code -} and {@code _}, the strictest rule among supported processors (Razorpay's).
  */
 public interface PaymentGateway {
-    /** Reserves funds without taking them. Same {@code idempotencyKey} twice must not reserve twice. */
-    PaymentResult authorize(String idempotencyKey, String userId, long amountPaise);
+    /**
+     * Creates the order the customer pays in their browser; nothing is reserved yet. {@code reference} is ours
+     * (the booking id) and is recorded on the order.
+     */
+    CheckoutSession startPayment(String reference, String userId, long amountPaise);
+
+    /**
+     * Checks the browser's result against the processor's own record, never trusting the browser for status or
+     * amount. Returns the authorization id if the payment for this exact order and amount is authorized, or
+     * {@link PaymentResult.Declined} if that payment failed. Throws {@link PaymentVerificationException} if the
+     * result is forged or belongs to another order or amount. Verifying the same result twice gives the same answer.
+     */
+    PaymentResult verifyCheckout(CheckoutSession session, CheckoutResult result);
 
     /**
      * Takes the reserved funds. Capturing the same authorization twice must not charge twice; the second call may

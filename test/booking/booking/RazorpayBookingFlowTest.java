@@ -63,6 +63,10 @@ class RazorpayBookingFlowTest {
     private final User alice = new User("u1", "Alice");
     private final User bob = new User("u2", "Bob");
 
+    private Booking confirm(User user, Booking booking) {
+        return service.confirm(user, booking.id(), razorpay.simulateCheckout(booking.checkout()));
+    }
+
     private List<String> deliveredEvents() {
         outbox.dispatchDue();
         return events;
@@ -71,15 +75,14 @@ class RazorpayBookingFlowTest {
     @Test
     void holdExpiringDuringPaymentLeavesTheAuthorizationForRazorpayToRefund() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
-        razorpay.duringAuthorize(() -> clock.advance(TTL));
+        razorpay.duringVerify(() -> clock.advance(TTL));
 
-        HoldExpiredException e = assertThrows(HoldExpiredException.class, () -> service.confirm(alice, booking.id()));
+        HoldExpiredException e = assertThrows(HoldExpiredException.class, () -> confirm(alice, booking));
 
         assertEquals(0, e.getSuppressed().length);
         assertEquals(BookingStatus.EXPIRED, booking.status());
         assertEquals(PaymentStatus.AUTHORIZED, razorpay.state("auth_1"));
-        // Authorized at NOW + TTL: the hold ran out while the customer was paying.
-        clock.set(NOW.plus(TTL).plus(RAZORPAY_EXPIRY));
+        clock.set(NOW.plus(RAZORPAY_EXPIRY));
         assertEquals(PaymentStatus.RELEASED, razorpay.state("auth_1"));
         assertEquals(List.of(), razorpay.captures());
     }
@@ -88,7 +91,7 @@ class RazorpayBookingFlowTest {
     void unknownCaptureIsRetriedIntoAConfirmedBooking() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
         razorpay.failCaptures(1);
-        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(PaymentPendingException.class, () -> confirm(alice, booking));
 
         clock.advance(Duration.ofSeconds(30));
         service.reconcilePendingPayments();
@@ -104,7 +107,7 @@ class RazorpayBookingFlowTest {
         discounts.add(dc);
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"), "ONE");
         razorpay.failCaptures(3);
-        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(PaymentPendingException.class, () -> confirm(alice, booking));
         clock.advance(Duration.ofSeconds(30));
         service.reconcilePendingPayments();
         clock.advance(Duration.ofSeconds(60));
@@ -135,7 +138,7 @@ class RazorpayBookingFlowTest {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
         razorpay.loseNextCaptureResponse(new RuntimeException("read timeout"));
         razorpay.failStatusLookups(2);
-        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(PaymentPendingException.class, () -> confirm(alice, booking));
         clock.advance(MAX_PENDING);
         assertEquals(List.of(booking.id()), service.reconcilePendingPayments().seatsReleasedBookingIds());
 
@@ -151,7 +154,7 @@ class RazorpayBookingFlowTest {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
         razorpay.failCaptures(1);
         razorpay.failStatusLookups(2);
-        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(PaymentPendingException.class, () -> confirm(alice, booking));
         clock.advance(Duration.ofSeconds(30));
         service.reconcilePendingPayments();
 

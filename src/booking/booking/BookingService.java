@@ -10,10 +10,13 @@ import booking.model.Show;
 import booking.model.User;
 import booking.notify.BookingEventType;
 import booking.notify.NotificationOutbox;
+import booking.payment.CheckoutResult;
+import booking.payment.CheckoutSession;
 import booking.payment.PaymentGateway;
 import booking.payment.PaymentRejectedException;
 import booking.payment.PaymentResult;
 import booking.payment.PaymentStatus;
+import booking.pricing.PriceComponent;
 import booking.pricing.PriceQuoteBuilder;
 
 import java.time.Clock;
@@ -76,13 +79,26 @@ public final class BookingService {
             quote.discount(discount.discount());
         }
 
-        Booking booking = new Booking(UUID.randomUUID().toString(), user, show, seatIds, quote.build(), now.plus(config.holdTtl()), discount);
-        inventory.hold(booking.id(), booking.seatIds(), booking.holdExpiresAt());
+        String bookingId = UUID.randomUUID().toString();
+        PriceComponent price = quote.build();
+        Instant expiresAt = now.plus(config.holdTtl());
+        inventory.hold(bookingId, seatIds, expiresAt);
+        // Seats first, so a customer is never sent to pay for seats someone else holds.
+        CheckoutSession checkout;
+        try {
+            checkout = payments.startPayment(bookingId, user.id(), price.totalPaise());
+        } catch (RuntimeException e) {
+            inventory.release(bookingId, seatIds);
+            throw e;
+        }
+        Booking booking = new Booking(bookingId, user, show, seatIds, price, expiresAt, discount, checkout);
         bookings.save(booking);
         return booking;
     }
 
-    public Booking confirm(User user, String bookingId) {
+    /** Called with what the customer's browser returned after paying for {@link Booking#checkout()}. */
+    public Booking confirm(User user, String bookingId, CheckoutResult checkoutResult) {
+        Objects.requireNonNull(checkoutResult, "checkoutResult");
         Booking booking = ownedBy(user, bookingId);
         ShowInventory inventory = inventoryOf(booking.show().id());
         synchronized (booking) {
@@ -92,7 +108,10 @@ public final class BookingService {
             if (!now.isBefore(booking.holdExpiresAt())) {
                 inventory.release(booking.id(), booking.seatIds());
                 booking.markExpired();
-                throw new HoldExpiredException(booking.id());
+                HoldExpiredException expired = new HoldExpiredException(booking.id());
+                // The customer paid in the browser after the hold ran out: that authorization must never be captured.
+                releasePaidAuthorization(booking, checkoutResult, expired);
+                throw expired;
             }
 
             DiscountCode discount = booking.discountCode().orElse(null);
@@ -101,13 +120,13 @@ public final class BookingService {
             }
             String authorizationId;
             try {
-                authorizationId = authorize(booking);
+                authorizationId = verifyPayment(booking, checkoutResult);
             } catch (RuntimeException e) {
                 if (discount != null) discount.releaseUse();
                 throw e;
             }
 
-            // Authorization ran outside the show lock, so the hold may have lapsed and the seats gone to someone else.
+            // Verification ran outside the show lock, so the hold may have lapsed and the seats gone to someone else.
             // Only funds were reserved, so losing the seats costs the customer nothing.
             try {
                 inventory.confirm(booking.id(), booking.seatIds());
@@ -177,13 +196,23 @@ public final class BookingService {
         return booking;
     }
 
-    private String authorize(Booking booking) {
-        // Booking id as idempotency key: a retried confirm for the same booking can't reserve funds twice.
-        PaymentResult result = payments.authorize(booking.id(), booking.user().id(), booking.price().totalPaise());
-        return switch (result) {
+    private String verifyPayment(Booking booking, CheckoutResult checkoutResult) {
+        return switch (payments.verifyCheckout(booking.checkout(), checkoutResult)) {
             case PaymentResult.Approved approved -> approved.authorizationId();
             case PaymentResult.Declined declined -> throw new PaymentDeclinedException(booking.id(), declined.reason());
         };
+    }
+
+    // Only a verified result names a real authorization of ours; anything else is attached to the primary exception.
+    private void releasePaidAuthorization(Booking booking, CheckoutResult checkoutResult, RuntimeException primary) {
+        String authorizationId;
+        try {
+            authorizationId = verifyPayment(booking, checkoutResult);
+        } catch (RuntimeException notVerified) {
+            primary.addSuppressed(notVerified);
+            return;
+        }
+        releaseAuthorization(authorizationId, primary);
     }
 
     /**

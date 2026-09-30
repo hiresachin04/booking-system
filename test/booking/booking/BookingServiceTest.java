@@ -14,8 +14,10 @@ import booking.notify.DeliveryStatus;
 import booking.notify.NotificationOutbox;
 import booking.notify.OutboxEntry;
 import booking.retry.RetryPolicy;
+import booking.payment.CheckoutResult;
 import booking.payment.PaymentRejectedException;
 import booking.payment.PaymentStatus;
+import booking.payment.PaymentVerificationException;
 import booking.pricing.Discount;
 import booking.support.FakePaymentGateway;
 import booking.support.Fixtures;
@@ -89,6 +91,11 @@ class BookingServiceTest {
     private final NotificationOutbox outbox = new NotificationOutbox(List.of(recorder), new RetryPolicy(3, Duration.ofSeconds(30)), Duration.ofDays(30), clock);
     private final BookingService service = service(outbox);
 
+    /** Pays in the "browser" and hands the signed result to confirm, as the frontend would. */
+    private Booking confirm(User user, Booking booking) {
+        return service.confirm(user, booking.id(), payments.simulateCheckout(booking.checkout()));
+    }
+
     private List<String> deliveredEvents() {
         outbox.dispatchDue();
         return events;
@@ -107,7 +114,7 @@ class BookingServiceTest {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1", "B1"));
         assertEquals(55_000, booking.price().totalPaise());
 
-        service.confirm(alice, booking.id());
+        confirm(alice, booking);
 
         assertEquals(BookingStatus.CONFIRMED, booking.status());
         assertEquals(List.of(new FakePaymentGateway.Capture("auth_1", "u1", 55_000)), payments.captures());
@@ -154,12 +161,12 @@ class BookingServiceTest {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
         payments.declineNext("insufficient funds");
 
-        assertThrows(PaymentDeclinedException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(PaymentDeclinedException.class, () -> confirm(alice, booking));
         assertEquals(BookingStatus.HELD, booking.status());
         assertThrows(SeatsUnavailableException.class, () -> service.holdSeats(bob, "sh", List.of("A1")));
         assertEquals(List.of(), deliveredEvents());
 
-        service.confirm(alice, booking.id());
+        confirm(alice, booking);
         assertEquals(BookingStatus.CONFIRMED, booking.status());
         assertEquals(1, payments.captures().size());
     }
@@ -167,9 +174,9 @@ class BookingServiceTest {
     @Test
     void neverCapturesWhenTheHoldExpiresWhilePaymentIsInFlight() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
-        payments.duringAuthorize(() -> clock.advance(TTL));
+        payments.duringVerify(() -> clock.advance(TTL));
 
-        assertThrows(HoldExpiredException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(HoldExpiredException.class, () -> confirm(alice, booking));
 
         assertEquals(BookingStatus.EXPIRED, booking.status());
         assertEquals(List.of(), payments.captures());
@@ -181,12 +188,12 @@ class BookingServiceTest {
     @Test
     void neverCapturesWhenSomeoneElseTookTheSeatWhilePaymentWasInFlight() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
-        payments.duringAuthorize(() -> {
+        payments.duringVerify(() -> {
             clock.advance(TTL);
             service.holdSeats(bob, "sh", List.of("A1"));
         });
 
-        assertThrows(HoldExpiredException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(HoldExpiredException.class, () -> confirm(alice, booking));
 
         assertEquals(List.of(), payments.captures());
         assertEquals(PaymentStatus.RELEASED, payments.state("auth_1"));
@@ -197,10 +204,10 @@ class BookingServiceTest {
     void failedVoidAfterExpiryIsReportedButStillLeavesTheCustomerUncharged() {
         RuntimeException voidFailure = new RuntimeException("gateway timeout");
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
-        payments.duringAuthorize(() -> clock.advance(TTL));
+        payments.duringVerify(() -> clock.advance(TTL));
         payments.failNextVoid(voidFailure);
 
-        HoldExpiredException e = assertThrows(HoldExpiredException.class, () -> service.confirm(alice, booking.id()));
+        HoldExpiredException e = assertThrows(HoldExpiredException.class, () -> confirm(alice, booking));
 
         assertEquals(List.of(voidFailure), List.of(e.getSuppressed()));
         assertEquals(BookingStatus.EXPIRED, booking.status());
@@ -213,7 +220,7 @@ class BookingServiceTest {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
         payments.failCaptures(1);
 
-        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(PaymentPendingException.class, () -> confirm(alice, booking));
         assertEquals(BookingStatus.PAYMENT_PENDING, booking.status());
         assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
 
@@ -233,7 +240,7 @@ class BookingServiceTest {
     void secondRetryWaitsTwiceAsLongAsTheFirst() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
         payments.failCaptures(2);
-        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(PaymentPendingException.class, () -> confirm(alice, booking));
         clock.advance(Duration.ofSeconds(30));
         service.reconcilePendingPayments();
 
@@ -252,7 +259,7 @@ class BookingServiceTest {
         DiscountCode dc = code("ONE", new Discount.Flat(5_000), 0, 1);
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"), "ONE");
         payments.failCaptures(3);
-        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(PaymentPendingException.class, () -> confirm(alice, booking));
         clock.advance(Duration.ofSeconds(30));
         assertEquals(List.of(), service.reconcilePendingPayments().seatsReleasedBookingIds());
         clock.advance(Duration.ofSeconds(60));
@@ -280,7 +287,7 @@ class BookingServiceTest {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"), "ONE");
         payments.failNextCapture(rejected);
 
-        RuntimeException thrown = assertThrows(RuntimeException.class, () -> service.confirm(alice, booking.id()));
+        RuntimeException thrown = assertThrows(RuntimeException.class, () -> confirm(alice, booking));
 
         assertSame(rejected, thrown);
         assertEquals(BookingStatus.PAYMENT_UNRESOLVED, booking.status());
@@ -298,7 +305,7 @@ class BookingServiceTest {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
         payments.loseNextCaptureResponse(new PaymentRejectedException("payment has already been captured"));
 
-        service.confirm(alice, booking.id());
+        confirm(alice, booking);
 
         assertEquals(BookingStatus.CONFIRMED, booking.status());
         assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
@@ -308,7 +315,7 @@ class BookingServiceTest {
     void retriedCaptureRejectedAsAlreadyCapturedStillConfirms() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
         payments.failCaptures(1);
-        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(PaymentPendingException.class, () -> confirm(alice, booking));
         payments.loseNextCaptureResponse(new PaymentRejectedException("payment has already been captured"));
         clock.advance(Duration.ofSeconds(30));
 
@@ -322,7 +329,7 @@ class BookingServiceTest {
     void failedVoidAfterReleasingTheSeatsIsRetriedOnTheNextRun() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
         payments.failNextCapture(new PaymentRejectedException("BAD_REQUEST_ERROR"));
-        assertThrows(PaymentRejectedException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(PaymentRejectedException.class, () -> confirm(alice, booking));
         payments.failNextVoid(new RuntimeException("void timed out"));
 
         ReconciliationReport failed = service.reconcilePendingPayments();
@@ -340,7 +347,7 @@ class BookingServiceTest {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
         payments.loseNextCaptureResponse(new RuntimeException("read timeout"));
 
-        service.confirm(alice, booking.id());
+        confirm(alice, booking);
 
         assertEquals(BookingStatus.CONFIRMED, booking.status());
         assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
@@ -355,7 +362,7 @@ class BookingServiceTest {
         payments.loseNextCaptureResponse(timeout);
         payments.failStatusLookups(1);
 
-        PaymentPendingException e = assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
+        PaymentPendingException e = assertThrows(PaymentPendingException.class, () -> confirm(alice, booking));
 
         assertSame(timeout, e.getCause());
         assertEquals(BookingStatus.PAYMENT_PENDING, booking.status());
@@ -369,7 +376,7 @@ class BookingServiceTest {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
         payments.loseNextCaptureResponse(new RuntimeException("read timeout"));
         payments.failStatusLookups(1);
-        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(PaymentPendingException.class, () -> confirm(alice, booking));
 
         service.reconcilePendingPayments();
 
@@ -383,7 +390,7 @@ class BookingServiceTest {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
         payments.loseNextCaptureResponse(new RuntimeException("read timeout"));
         payments.failStatusLookups(2);
-        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(PaymentPendingException.class, () -> confirm(alice, booking));
 
         ReconciliationReport firstRun = service.reconcilePendingPayments();
         assertEquals(List.of(booking.id()), firstRun.failures().stream().map(ReconciliationReport.Failure::bookingId).toList());
@@ -401,11 +408,11 @@ class BookingServiceTest {
         Booking stuck = service.holdSeats(alice, "sh", List.of("A1"));
         payments.loseNextCaptureResponse(new RuntimeException("read timeout"));
         payments.failStatusLookups(1);
-        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, stuck.id()));
+        assertThrows(PaymentPendingException.class, () -> confirm(alice, stuck));
         Booking settleable = service.holdSeats(bob, "sh", List.of("A2"));
         payments.loseNextCaptureResponse(new RuntimeException("read timeout"));
         payments.failStatusLookups(1);
-        assertThrows(PaymentPendingException.class, () -> service.confirm(bob, settleable.id()));
+        assertThrows(PaymentPendingException.class, () -> confirm(bob, settleable));
 
         // One lookup fails during this run; whichever booking hits it stays pending, the other settles.
         payments.failStatusLookups(1);
@@ -422,7 +429,7 @@ class BookingServiceTest {
         if (processorCaptured) payments.loseNextCaptureResponse(new RuntimeException("read timeout"));
         else payments.failNextCapture(new RuntimeException("connection reset"));
         payments.failStatusLookups(lookupFailures);
-        assertThrows(PaymentPendingException.class, () -> service.confirm(user, booking.id()));
+        assertThrows(PaymentPendingException.class, () -> confirm(user, booking));
         return booking;
     }
 
@@ -469,7 +476,7 @@ class BookingServiceTest {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"), "ONE");
         payments.loseNextCaptureResponse(new RuntimeException("read timeout"));
         payments.failStatusLookups(2);
-        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(PaymentPendingException.class, () -> confirm(alice, booking));
         clock.advance(MAX_PENDING);
         service.reconcilePendingPayments();
         service.holdSeats(bob, "sh", List.of("A1"));
@@ -497,7 +504,7 @@ class BookingServiceTest {
         assertEquals(BookingStatus.PAYMENT_FAILED, booking.status());
         assertEquals(PaymentStatus.RELEASED, payments.state("auth_1"));
         assertEquals(List.of(), payments.refunds());
-        service.confirm(bob, resold.id());
+        confirm(bob, resold);
         assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
     }
 
@@ -537,28 +544,102 @@ class BookingServiceTest {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
         payments.loseNextCaptureResponse(new RuntimeException("read timeout"));
         payments.failStatusLookups(1);
-        assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(PaymentPendingException.class, () -> confirm(alice, booking));
 
         assertThrows(IllegalBookingStateException.class, () -> service.cancel(alice, booking.id()));
         assertEquals(List.of(), payments.refunds());
     }
 
     @Test
-    void rejectsConfirmAfterExpiryWithoutContactingTheGateway() {
+    void customerWhoPaidAfterTheHoldRanOutHasTheAuthorizationVoided() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        CheckoutResult paidLate = payments.simulateCheckout(booking.checkout());
         clock.advance(TTL);
 
-        assertThrows(HoldExpiredException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(HoldExpiredException.class, () -> service.confirm(alice, booking.id(), paidLate));
+
         assertEquals(BookingStatus.EXPIRED, booking.status());
-        assertEquals(0, payments.authorizeAttempts());
+        assertEquals(PaymentStatus.RELEASED, payments.state("auth_1"));
+        assertEquals(List.of(), payments.captures());
+    }
+
+    @Test
+    void forgedResultAfterTheHoldRanOutVoidsNothingAndIsReported() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        CheckoutResult paid = payments.simulateCheckout(booking.checkout());
+        clock.advance(TTL);
+
+        HoldExpiredException e = assertThrows(HoldExpiredException.class,
+                () -> service.confirm(alice, booking.id(), new CheckoutResult(paid.orderId(), paid.paymentId(), "forged")));
+
+        assertInstanceOf(PaymentVerificationException.class, e.getSuppressed()[0]);
+        assertEquals(PaymentStatus.AUTHORIZED, payments.state("auth_1"));
+    }
+
+    // --- checkout ---
+
+    @Test
+    void holdStartsACheckoutForExactlyTheQuotedAmount() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1", "B1"));
+
+        assertEquals(55_000, booking.checkout().amountPaise());
+        assertEquals("INR", booking.checkout().currency());
+    }
+
+    @Test
+    void failureToStartPaymentGivesTheSeatsBack() {
+        RuntimeException down = new RuntimeException("orders api down");
+        payments.failNextStartPayment(down);
+
+        RuntimeException thrown = assertThrows(RuntimeException.class, () -> service.holdSeats(alice, "sh", List.of("A1")));
+
+        assertSame(down, thrown);
+        assertEquals(SeatStatus.AVAILABLE, inventory.status("A1"));
+        assertEquals(List.of(), bookings.findByUser(alice));
+    }
+
+    @Test
+    void rejectsAForgedSignatureAndKeepsTheHoldForARetry() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        CheckoutResult paid = payments.simulateCheckout(booking.checkout());
+
+        assertThrows(PaymentVerificationException.class,
+                () -> service.confirm(alice, booking.id(), new CheckoutResult(paid.orderId(), paid.paymentId(), "0".repeat(64))));
+        assertEquals(BookingStatus.HELD, booking.status());
+        assertEquals(List.of(), payments.captures());
+
+        service.confirm(alice, booking.id(), paid);
+        assertEquals(BookingStatus.CONFIRMED, booking.status());
+    }
+
+    @Test
+    void rejectsAPaymentMadeForAnotherBookingsOrder() {
+        Booking expensive = service.holdSeats(alice, "sh", List.of("B1", "B2"));
+        Booking cheap = service.holdSeats(alice, "sh", List.of("A1"));
+        CheckoutResult paidForCheap = payments.simulateCheckout(cheap.checkout());
+
+        assertThrows(PaymentVerificationException.class, () -> service.confirm(alice, expensive.id(), paidForCheap));
+        assertEquals(BookingStatus.HELD, expensive.status());
+        assertEquals(SeatStatus.HELD, inventory.status("B1"));
+    }
+
+    @Test
+    void rejectedVerificationGivesTheDiscountUseBack() {
+        DiscountCode dc = code("ONE", new Discount.Flat(5_000), 0, 1);
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"), "ONE");
+        CheckoutResult paid = payments.simulateCheckout(booking.checkout());
+
+        assertThrows(PaymentVerificationException.class,
+                () -> service.confirm(alice, booking.id(), new CheckoutResult(paid.orderId(), paid.paymentId(), "forged")));
+        assertEquals(0, dc.used());
     }
 
     @Test
     void rejectsConfirmingTwice() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
-        service.confirm(alice, booking.id());
+        confirm(alice, booking);
 
-        assertThrows(IllegalBookingStateException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(IllegalBookingStateException.class, () -> confirm(alice, booking));
         assertEquals(1, payments.captures().size());
     }
 
@@ -568,23 +649,23 @@ class BookingServiceTest {
         AtomicReference<Throwable> secondOutcome = new AtomicReference<>();
         Thread second = new Thread(() -> {
             try {
-                service.confirm(alice, booking.id());
+                confirm(alice, booking);
             } catch (Throwable t) {
                 secondOutcome.set(t);
             }
         });
-        // Start the second confirm while the first is inside authorize(), and wait until it is parked on a monitor.
-        payments.duringAuthorize(() -> {
+        // Start the second confirm while the first is inside verifyCheckout(), and wait until it is parked on a monitor.
+        payments.duringVerify(() -> {
             second.start();
             awaitBlocked(second);
         });
 
-        service.confirm(alice, booking.id());
+        confirm(alice, booking);
         second.join(5_000);
 
         assertInstanceOf(IllegalBookingStateException.class, secondOutcome.get());
-        // Idempotency would hide a second authorization; the booking lock must stop the request reaching the gateway.
-        assertEquals(1, payments.authorizeAttempts());
+        // The booking lock must stop the second confirm before it reaches the gateway at all.
+        assertEquals(1, payments.verifyAttempts());
         assertEquals(1, payments.captures().size());
         assertEquals(BookingStatus.CONFIRMED, booking.status());
     }
@@ -604,7 +685,7 @@ class BookingServiceTest {
         List<Boolean> outcomes = Race.run(users.size(), i -> {
             try {
                 Booking b = service.holdSeats(users.get(i), "sh", List.of("B1"));
-                service.confirm(users.get(i), b.id());
+                confirm(users.get(i), b);
                 return true;
             } catch (SeatsUnavailableException e) {
                 return false;
@@ -617,7 +698,7 @@ class BookingServiceTest {
     @Test
     void hidesAnotherUsersBookingAsMissing() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
-        assertThrows(NoSuchElementException.class, () -> service.confirm(bob, booking.id()));
+        assertThrows(NoSuchElementException.class, () -> confirm(bob, booking));
         assertThrows(NoSuchElementException.class, () -> service.release(bob, booking.id()));
         assertEquals(BookingStatus.HELD, booking.status());
     }
@@ -629,7 +710,7 @@ class BookingServiceTest {
 
         assertEquals(BookingStatus.RELEASED, booking.status());
         service.holdSeats(bob, "sh", List.of("A1"));
-        assertThrows(IllegalBookingStateException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(IllegalBookingStateException.class, () -> confirm(alice, booking));
     }
 
     // --- discounts ---
@@ -641,7 +722,7 @@ class BookingServiceTest {
         assertEquals(15_000, booking.price().totalPaise());
         assertEquals(0, dc.used());
 
-        service.confirm(alice, booking.id());
+        confirm(alice, booking);
         assertEquals(1, dc.used());
         assertEquals(15_000, payments.captures().getFirst().amountPaise());
     }
@@ -680,7 +761,7 @@ class BookingServiceTest {
 
         List<Boolean> outcomes = Race.run(2, i -> {
             try {
-                service.confirm(owners.get(i), both.get(i).id());
+                confirm(owners.get(i), both.get(i));
                 return true;
             } catch (DiscountRejectedException e) {
                 return false;
@@ -700,7 +781,7 @@ class BookingServiceTest {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"), "ONE");
         payments.declineNext("card expired");
 
-        assertThrows(PaymentDeclinedException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(PaymentDeclinedException.class, () -> confirm(alice, booking));
         assertEquals(0, dc.used());
     }
 
@@ -708,9 +789,9 @@ class BookingServiceTest {
     void expiryDuringPaymentGivesTheDiscountUseBack() {
         DiscountCode dc = code("ONE", new Discount.Flat(5_000), 0, 1);
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"), "ONE");
-        payments.duringAuthorize(() -> clock.advance(TTL));
+        payments.duringVerify(() -> clock.advance(TTL));
 
-        assertThrows(HoldExpiredException.class, () -> service.confirm(alice, booking.id()));
+        assertThrows(HoldExpiredException.class, () -> confirm(alice, booking));
         assertEquals(0, dc.used());
     }
 
@@ -719,7 +800,7 @@ class BookingServiceTest {
     @Test
     void cancelRefundsPerPolicyAndFreesTheSeats() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
-        service.confirm(alice, booking.id());
+        confirm(alice, booking);
 
         service.cancel(alice, booking.id());
 
@@ -733,7 +814,7 @@ class BookingServiceTest {
     @Test
     void cancelWithExactlyFourHoursNoticeStillGetsTheHalfRefund() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
-        service.confirm(alice, booking.id());
+        confirm(alice, booking);
         clock.set(WEEKDAY_SHOW.minus(Duration.ofHours(4)));
         assertEquals(10_000, service.cancel(alice, booking.id()).refundedPaise());
     }
@@ -741,7 +822,7 @@ class BookingServiceTest {
     @Test
     void cancelJustUnderFourHoursBeforeShowRefundsNothing() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
-        service.confirm(alice, booking.id());
+        confirm(alice, booking);
         clock.set(WEEKDAY_SHOW.minus(Duration.ofHours(4)).plusNanos(1));
 
         service.cancel(alice, booking.id());
@@ -752,7 +833,7 @@ class BookingServiceTest {
     @Test
     void rejectsCancelOnceTheShowHasStarted() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
-        service.confirm(alice, booking.id());
+        confirm(alice, booking);
         clock.set(WEEKDAY_SHOW);
 
         assertThrows(ShowAlreadyStartedException.class, () -> service.cancel(alice, booking.id()));
@@ -769,7 +850,7 @@ class BookingServiceTest {
     @Test
     void rejectsCancellingTwice() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
-        service.confirm(alice, booking.id());
+        confirm(alice, booking);
         service.cancel(alice, booking.id());
         assertThrows(IllegalBookingStateException.class, () -> service.cancel(alice, booking.id()));
         assertEquals(1, payments.refunds().size());
@@ -780,7 +861,7 @@ class BookingServiceTest {
     @Test
     void publishesTheEventWithoutDeliveringItInsideConfirm() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
-        service.confirm(alice, booking.id());
+        confirm(alice, booking);
 
         assertEquals(List.of(), events);
         assertEquals(1, outbox.entries(DeliveryStatus.PENDING).size());
@@ -799,7 +880,7 @@ class BookingServiceTest {
         BookingService withBrokenListener = service(brokenOutbox);
         Booking booking = withBrokenListener.holdSeats(alice, "sh", List.of("A1"));
 
-        withBrokenListener.confirm(alice, booking.id());
+        withBrokenListener.confirm(alice, booking.id(), payments.simulateCheckout(booking.checkout()));
         brokenOutbox.dispatchDue();
 
         assertEquals(BookingStatus.CONFIRMED, booking.status());

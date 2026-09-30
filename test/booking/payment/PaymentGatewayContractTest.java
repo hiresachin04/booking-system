@@ -36,22 +36,75 @@ class PaymentGatewayContractTest {
                 Arguments.of(Named.of("razorpay", new Profile(c -> FakePaymentGateway.razorpay(c, RAZORPAY_EXPIRY), RAZORPAY_EXPIRY))));
     }
 
-    private static String authorize(PaymentGateway gateway, String key) {
-        return switch (gateway.authorize(key, "u1", 20_000)) {
-            case PaymentResult.Approved approved -> approved.authorizationId();
-            case PaymentResult.Declined declined -> throw new AssertionError("declined: " + declined.reason());
+    /** Starts a payment, pays it in the simulated browser, verifies it, and returns the authorization id. */
+    private static String authorize(FakePaymentGateway gateway, String reference) {
+        CheckoutSession session = gateway.startPayment(reference, "u1", 20_000);
+        return approved(gateway.verifyCheckout(session, gateway.simulateCheckout(session)));
+    }
+
+    private static String approved(PaymentResult result) {
+        return switch (result) {
+            case PaymentResult.Approved a -> a.authorizationId();
+            case PaymentResult.Declined d -> throw new AssertionError("declined: " + d.reason());
         };
     }
 
     @ParameterizedTest
     @MethodSource("profiles")
-    void authorizingTwiceWithOneKeyReservesOnce(Profile profile) {
+    void verifyingTheSameResultTwiceGivesTheSameAuthorization(Profile profile) {
         FakePaymentGateway gateway = profile.create().apply(clock);
-        String first = authorize(gateway, "booking-0001");
-        String second = authorize(gateway, "booking-0001");
+        CheckoutSession session = gateway.startPayment("booking-0001", "u1", 20_000);
+        CheckoutResult paid = gateway.simulateCheckout(session);
+
+        String first = approved(gateway.verifyCheckout(session, paid));
+        String second = approved(gateway.verifyCheckout(session, paid));
 
         assertEquals(first, second);
         assertEquals(PaymentStatus.AUTHORIZED, gateway.status(first));
+    }
+
+    @ParameterizedTest
+    @MethodSource("profiles")
+    void rejectsAResultWhoseSignatureDoesNotMatch(Profile profile) {
+        FakePaymentGateway gateway = profile.create().apply(clock);
+        CheckoutSession session = gateway.startPayment("booking-0001", "u1", 20_000);
+        CheckoutResult paid = gateway.simulateCheckout(session);
+
+        assertThrows(PaymentVerificationException.class,
+                () -> gateway.verifyCheckout(session, new CheckoutResult(paid.orderId(), paid.paymentId(), paid.signature() + "0")));
+    }
+
+    @ParameterizedTest
+    @MethodSource("profiles")
+    void rejectsAGenuineResultForAnotherOrder(Profile profile) {
+        FakePaymentGateway gateway = profile.create().apply(clock);
+        CheckoutSession mine = gateway.startPayment("booking-0001", "u1", 20_000);
+        CheckoutSession other = gateway.startPayment("booking-0002", "u1", 20_000);
+
+        assertThrows(PaymentVerificationException.class, () -> gateway.verifyCheckout(mine, gateway.simulateCheckout(other)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("profiles")
+    void rejectsAPaymentForADifferentAmountThanTheSessionExpects(Profile profile) {
+        FakePaymentGateway gateway = profile.create().apply(clock);
+        CheckoutSession session = gateway.startPayment("booking-0001", "u1", 20_000);
+        CheckoutResult paid = gateway.simulateCheckout(session);
+        CheckoutSession pricier = new CheckoutSession(session.orderId(), 55_000, session.currency(), session.publicKeyId());
+
+        assertThrows(PaymentVerificationException.class, () -> gateway.verifyCheckout(pricier, paid));
+    }
+
+    @ParameterizedTest
+    @MethodSource("profiles")
+    void reportsAFailedPaymentAsDeclined(Profile profile) {
+        FakePaymentGateway gateway = profile.create().apply(clock);
+        CheckoutSession session = gateway.startPayment("booking-0001", "u1", 20_000);
+        gateway.declineNext("insufficient funds");
+
+        PaymentResult result = gateway.verifyCheckout(session, gateway.simulateCheckout(session));
+
+        assertEquals(new PaymentResult.Declined("insufficient funds"), result);
     }
 
     @ParameterizedTest

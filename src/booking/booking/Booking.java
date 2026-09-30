@@ -2,6 +2,7 @@ package booking.booking;
 
 import booking.discount.DiscountCode;
 import booking.model.Show;
+import booking.payment.CheckoutSession;
 import booking.model.User;
 import booking.pricing.PriceComponent;
 import booking.retry.RetryPolicy;
@@ -20,6 +21,7 @@ public final class Booking {
     private final PriceComponent price;
     private final Instant holdExpiresAt;
     private final DiscountCode discountCode;
+    private final CheckoutSession checkout;
     private BookingStatus status = BookingStatus.HELD;
     private String paymentId;
     private Instant paymentPendingSince;
@@ -28,7 +30,8 @@ public final class Booking {
     private boolean captureGivenUp;
     private long refundedPaise;
 
-    Booking(String id, User user, Show show, List<String> seatIds, PriceComponent price, Instant holdExpiresAt, DiscountCode discountCode) {
+    Booking(String id, User user, Show show, List<String> seatIds, PriceComponent price, Instant holdExpiresAt, DiscountCode discountCode,
+            CheckoutSession checkout) {
         this.id = Objects.requireNonNull(id, "id");
         this.user = Objects.requireNonNull(user, "user");
         this.show = Objects.requireNonNull(show, "show");
@@ -36,6 +39,7 @@ public final class Booking {
         this.price = Objects.requireNonNull(price, "price");
         this.holdExpiresAt = Objects.requireNonNull(holdExpiresAt, "holdExpiresAt");
         this.discountCode = discountCode;
+        this.checkout = Objects.requireNonNull(checkout, "checkout");
     }
 
     public String id() {
@@ -60,6 +64,11 @@ public final class Booking {
 
     public Instant holdExpiresAt() {
         return holdExpiresAt;
+    }
+
+    /** Handed to the frontend so the customer can pay for exactly this booking's order. */
+    public CheckoutSession checkout() {
+        return checkout;
     }
 
     public Optional<DiscountCode> discountCode() {

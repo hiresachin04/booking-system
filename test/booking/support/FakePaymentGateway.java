@@ -1,9 +1,13 @@
 package booking.support;
 
+import booking.payment.CheckoutResult;
+import booking.payment.CheckoutSession;
 import booking.payment.PaymentGateway;
 import booking.payment.PaymentRejectedException;
 import booking.payment.PaymentResult;
 import booking.payment.PaymentStatus;
+import booking.payment.PaymentVerificationException;
+import booking.payment.RazorpaySignature;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -29,7 +33,14 @@ public final class FakePaymentGateway implements PaymentGateway {
 
     public record Refund(String paymentId, long amountPaise) {}
 
-    private record Authorization(String userId, long amountPaise, Instant authorizedAt) {}
+    private record Authorization(String orderId, String userId, long amountPaise, Instant authorizedAt) {}
+
+    private record Order(String reference, String userId, long amountPaise) {}
+
+    /** The fake's API key secret; checkout results are signed with it exactly as Razorpay signs them. */
+    public static final String KEY_SECRET = "fake_key_secret";
+    private static final String KEY_ID = "rzp_test_fake";
+    private static final int MAX_RECEIPT_LENGTH = 40;
 
     private static final Duration STRIPE_AUTHORIZATION_VALIDITY = Duration.ofDays(7);
 
@@ -38,13 +49,17 @@ public final class FakePaymentGateway implements PaymentGateway {
     private final boolean canVoid;
     private final boolean rejectsSecondCapture;
 
-    private final Map<String, String> authorizationIdByKey = new HashMap<>();
+    private final Map<String, Order> orders = new HashMap<>();
+    private final Map<String, String> authorizedPaymentByOrder = new HashMap<>();
+    private final Map<String, String> orderOfFailedPayment = new HashMap<>();
+    private final Map<String, String> failureReasons = new HashMap<>();
     private final Map<String, Authorization> authorizations = new HashMap<>();
     private final Map<String, PaymentStatus> states = new HashMap<>();
     private final List<Capture> captures = new ArrayList<>();
     private final List<Refund> refunds = new ArrayList<>();
     private final Set<String> refundKeys = new HashSet<>();
-    private int authorizeAttempts;
+    private int verifyAttempts;
+    private RuntimeException failNextStartPayment;
     private int captureAttempts;
     private int unavailableCaptures;
     private String declineNextWith;
@@ -54,7 +69,7 @@ public final class FakePaymentGateway implements PaymentGateway {
     private RuntimeException failNextVoid;
     private RuntimeException failNextRefund;
     private RuntimeException loseNextRefundResponse;
-    private Runnable duringAuthorize = () -> {};
+    private Runnable duringVerify = () -> {};
 
     /** Stripe-like, on the system clock; for tests that never let an authorization run for 7 days. */
     public FakePaymentGateway() {
@@ -76,8 +91,13 @@ public final class FakePaymentGateway implements PaymentGateway {
         return new FakePaymentGateway(clock, manualExpiryPeriod, false, true);
     }
 
+    /** The next {@link #simulateCheckout} ends in a failed payment, as when the bank declines the card. */
     public synchronized void declineNext(String reason) {
         declineNextWith = reason;
+    }
+
+    public synchronized void failNextStartPayment(RuntimeException failure) {
+        failNextStartPayment = failure;
     }
 
     public synchronized void failNextCapture(RuntimeException failure) {
@@ -111,30 +131,69 @@ public final class FakePaymentGateway implements PaymentGateway {
         failNextVoid = failure;
     }
 
-    /** Runs inside the next authorize call, e.g. to let the hold expire while the customer is paying. */
-    public synchronized void duringAuthorize(Runnable action) {
-        duringAuthorize = action;
+    /** Runs inside the next verifyCheckout call, e.g. to let the hold expire while the server is checking. */
+    public synchronized void duringVerify(Runnable action) {
+        duringVerify = action;
     }
 
     @Override
-    public synchronized PaymentResult authorize(String idempotencyKey, String userId, long amountPaise) {
-        requireValidKey(idempotencyKey);
-        authorizeAttempts++;
-        Runnable action = duringAuthorize;
-        duringAuthorize = () -> {};
-        action.run();
-        if (declineNextWith != null) {
-            String reason = declineNextWith;
-            declineNextWith = null;
-            return new PaymentResult.Declined(reason);
+    public synchronized CheckoutSession startPayment(String reference, String userId, long amountPaise) {
+        if (failNextStartPayment != null) {
+            RuntimeException failure = failNextStartPayment;
+            failNextStartPayment = null;
+            throw failure;
         }
-        String existing = authorizationIdByKey.get(idempotencyKey);
-        if (existing != null) return new PaymentResult.Approved(existing);
-        String authorizationId = "auth_" + (authorizations.size() + 1);
-        authorizationIdByKey.put(idempotencyKey, authorizationId);
-        authorizations.put(authorizationId, new Authorization(userId, amountPaise, clock.instant()));
-        states.put(authorizationId, PaymentStatus.AUTHORIZED);
-        return new PaymentResult.Approved(authorizationId);
+        if (reference.length() > MAX_RECEIPT_LENGTH) throw new PaymentRejectedException("BAD_REQUEST_ERROR: receipt too long");
+        String orderId = "order_" + (orders.size() + 1);
+        orders.put(orderId, new Order(reference, userId, amountPaise));
+        return new CheckoutSession(orderId, amountPaise, "INR", KEY_ID);
+    }
+
+    /**
+     * Plays the customer's browser: pays the order and returns the signed result the Checkout handler would get.
+     * Paying an order that already has an authorized payment returns that payment again.
+     */
+    public synchronized CheckoutResult simulateCheckout(CheckoutSession session) {
+        Order order = orders.get(session.orderId());
+        if (order == null) throw new IllegalArgumentException("unknown order " + session.orderId());
+        String paymentId = authorizedPaymentByOrder.get(session.orderId());
+        if (paymentId == null && declineNextWith != null) {
+            paymentId = "failed_" + (failureReasons.size() + 1);
+            failureReasons.put(paymentId, declineNextWith);
+            orderOfFailedPayment.put(paymentId, session.orderId());
+            declineNextWith = null;
+        } else if (paymentId == null) {
+            paymentId = "auth_" + (authorizations.size() + 1);
+            authorizations.put(paymentId, new Authorization(session.orderId(), order.userId(), order.amountPaise(), clock.instant()));
+            states.put(paymentId, PaymentStatus.AUTHORIZED);
+            authorizedPaymentByOrder.put(session.orderId(), paymentId);
+        }
+        return new CheckoutResult(session.orderId(), paymentId, RazorpaySignature.sign(KEY_SECRET, session.orderId(), paymentId));
+    }
+
+    @Override
+    public synchronized PaymentResult verifyCheckout(CheckoutSession session, CheckoutResult result) {
+        verifyAttempts++;
+        Runnable action = duringVerify;
+        duringVerify = () -> {};
+        action.run();
+        if (!RazorpaySignature.matches(KEY_SECRET, result)) throw new PaymentVerificationException("signature mismatch");
+        if (!result.orderId().equals(session.orderId())) {
+            throw new PaymentVerificationException("result is for order " + result.orderId() + ", not " + session.orderId());
+        }
+        String failureReason = failureReasons.get(result.paymentId());
+        if (failureReason != null && session.orderId().equals(orderOfFailedPayment.get(result.paymentId()))) {
+            return new PaymentResult.Declined(failureReason);
+        }
+        Authorization auth = authorizations.get(result.paymentId());
+        if (auth == null || !auth.orderId().equals(session.orderId())) {
+            throw new PaymentVerificationException("payment " + result.paymentId() + " is not for order " + session.orderId());
+        }
+        if (auth.amountPaise() != session.amountPaise()) {
+            throw new PaymentVerificationException("paid " + auth.amountPaise() + " paise, expected " + session.amountPaise());
+        }
+        if (requireKnown(result.paymentId()) == PaymentStatus.RELEASED) return new PaymentResult.Declined("authorization expired");
+        return new PaymentResult.Approved(result.paymentId());
     }
 
     @Override
@@ -228,9 +287,9 @@ public final class FakePaymentGateway implements PaymentGateway {
         return state;
     }
 
-    /** Every call to authorize, including idempotent replays that returned an existing authorization. */
-    public synchronized int authorizeAttempts() {
-        return authorizeAttempts;
+    /** Every call to verifyCheckout, including repeats of the same result. */
+    public synchronized int verifyAttempts() {
+        return verifyAttempts;
     }
 
     /** Every call to capture, including ones made to fail. */

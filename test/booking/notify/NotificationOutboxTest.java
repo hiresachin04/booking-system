@@ -68,12 +68,13 @@ class NotificationOutboxTest {
     private Booking confirmedBooking() {
         ShowRepository shows = new ShowRepository(clock);
         shows.add(Fixtures.show("sh", NOW.plus(Duration.ofHours(8))));
-        BookingService service = new BookingService(shows, new BookingRepository(), new DiscountRegistry(), new FakePaymentGateway(),
+        FakePaymentGateway payments = new FakePaymentGateway();
+        BookingService service = new BookingService(shows, new BookingRepository(), new DiscountRegistry(), payments,
                 new TieredRefundPolicy(List.of()), new BookingConfig(Duration.ofMinutes(10), 10, 0, Duration.ofMinutes(15), BookingConfig.DEFAULT_CAPTURE_RETRY), clock,
                 new NotificationOutbox(List.of(), RETRY, RETENTION, clock));
         User alice = new User("u1", "Alice");
         Booking b = service.holdSeats(alice, "sh", List.of("A1"));
-        return service.confirm(alice, b.id());
+        return service.confirm(alice, b.id(), payments.simulateCheckout(b.checkout()));
     }
 
     @Test
