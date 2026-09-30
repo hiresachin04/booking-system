@@ -3,9 +3,9 @@ package booking.payment;
 import java.util.Objects;
 
 public sealed interface PaymentResult {
-    record Approved(String chargeId) implements PaymentResult {
+    record Approved(String authorizationId) implements PaymentResult {
         public Approved {
-            Objects.requireNonNull(chargeId, "chargeId");
+            Objects.requireNonNull(authorizationId, "authorizationId");
         }
     }
 

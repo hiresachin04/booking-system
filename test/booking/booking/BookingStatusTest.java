@@ -17,8 +17,9 @@ class BookingStatusTest {
     }
 
     @Test
-    void heldCanOnlyBeConfirmedReleasedOrExpired() {
-        assertEquals(EnumSet.of(BookingStatus.CONFIRMED, BookingStatus.RELEASED, BookingStatus.EXPIRED), reachableFrom(BookingStatus.HELD));
+    void heldCanOnlyBeConfirmedReleasedExpiredOrFailPayment() {
+        assertEquals(EnumSet.of(BookingStatus.CONFIRMED, BookingStatus.RELEASED, BookingStatus.EXPIRED, BookingStatus.PAYMENT_FAILED),
+                reachableFrom(BookingStatus.HELD));
     }
 
     @Test
@@ -28,7 +29,7 @@ class BookingStatusTest {
 
     @Test
     void terminalStatesGoNowhere() {
-        for (BookingStatus terminal : EnumSet.of(BookingStatus.RELEASED, BookingStatus.EXPIRED, BookingStatus.CANCELLED)) {
+        for (BookingStatus terminal : EnumSet.of(BookingStatus.RELEASED, BookingStatus.EXPIRED, BookingStatus.PAYMENT_FAILED, BookingStatus.CANCELLED)) {
             assertEquals(EnumSet.noneOf(BookingStatus.class), reachableFrom(terminal), terminal.name());
         }
     }

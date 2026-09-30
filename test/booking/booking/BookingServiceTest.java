@@ -21,6 +21,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.NoSuchElementException;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -75,14 +76,15 @@ class BookingServiceTest {
     // --- hold & confirm ---
 
     @Test
-    void confirmChargesTheQuotedAmountAndBooksTheSeats() {
+    void confirmCapturesTheQuotedAmountAndBooksTheSeats() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1", "B1"));
         assertEquals(55_000, booking.price().totalPaise());
 
         service.confirm(alice, booking.id());
 
         assertEquals(BookingStatus.CONFIRMED, booking.status());
-        assertEquals(List.of(new FakePaymentGateway.Charge("ch_1", "u1", 55_000)), payments.charges());
+        assertEquals(List.of(new FakePaymentGateway.Capture("auth_1", "u1", 55_000)), payments.captures());
+        assertEquals(Optional.of("auth_1"), booking.paymentId());
         assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
         assertEquals(SeatStatus.BOOKED, inventory.status("B1"));
         assertEquals(List.of("confirmed " + booking.id()), events);
@@ -132,44 +134,88 @@ class BookingServiceTest {
 
         service.confirm(alice, booking.id());
         assertEquals(BookingStatus.CONFIRMED, booking.status());
-        assertEquals(1, payments.charges().size());
+        assertEquals(1, payments.captures().size());
     }
 
     @Test
-    void refundsInFullWhenTheHoldExpiresWhilePaymentIsInFlight() {
+    void neverCapturesWhenTheHoldExpiresWhilePaymentIsInFlight() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
-        payments.duringCharge(() -> clock.advance(TTL));
+        payments.duringAuthorize(() -> clock.advance(TTL));
 
         assertThrows(HoldExpiredException.class, () -> service.confirm(alice, booking.id()));
 
         assertEquals(BookingStatus.EXPIRED, booking.status());
-        assertEquals(List.of(new FakePaymentGateway.Refund("ch_1", 20_000)), payments.refunds());
+        assertEquals(List.of(), payments.captures());
+        assertEquals(FakePaymentGateway.AuthorizationState.VOIDED, payments.state("auth_1"));
         assertEquals(SeatStatus.AVAILABLE, inventory.status("A1"));
         assertEquals(List.of(), events);
     }
 
     @Test
-    void refundsWhenSomeoneElseTookTheSeatWhilePaymentWasInFlight() {
+    void neverCapturesWhenSomeoneElseTookTheSeatWhilePaymentWasInFlight() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
-        payments.duringCharge(() -> {
+        payments.duringAuthorize(() -> {
             clock.advance(TTL);
             service.holdSeats(bob, "sh", List.of("A1"));
         });
 
         assertThrows(HoldExpiredException.class, () -> service.confirm(alice, booking.id()));
 
-        assertEquals(1, payments.refunds().size());
+        assertEquals(List.of(), payments.captures());
+        assertEquals(FakePaymentGateway.AuthorizationState.VOIDED, payments.state("auth_1"));
         assertEquals(SeatStatus.HELD, inventory.status("A1"));
     }
 
     @Test
-    void rejectsConfirmAfterExpiryWithoutCharging() {
+    void failedVoidAfterExpiryIsReportedButStillLeavesTheCustomerUncharged() {
+        RuntimeException voidFailure = new RuntimeException("gateway timeout");
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        payments.duringAuthorize(() -> clock.advance(TTL));
+        payments.failNextVoid(voidFailure);
+
+        HoldExpiredException e = assertThrows(HoldExpiredException.class, () -> service.confirm(alice, booking.id()));
+
+        assertEquals(List.of(voidFailure), List.of(e.getSuppressed()));
+        assertEquals(BookingStatus.EXPIRED, booking.status());
+        assertEquals(List.of(), payments.captures());
+        assertEquals(SeatStatus.AVAILABLE, inventory.status("A1"));
+    }
+
+    @Test
+    void failedCaptureGivesTheSeatsBackAndVoidsTheAuthorization() {
+        RuntimeException captureFailure = new RuntimeException("processor unavailable");
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        payments.failNextCapture(captureFailure);
+
+        RuntimeException thrown = assertThrows(RuntimeException.class, () -> service.confirm(alice, booking.id()));
+
+        assertSame(captureFailure, thrown);
+        assertEquals(BookingStatus.PAYMENT_FAILED, booking.status());
+        assertEquals(FakePaymentGateway.AuthorizationState.VOIDED, payments.state("auth_1"));
+        assertEquals(SeatStatus.AVAILABLE, inventory.status("A1"));
+        assertEquals(Optional.empty(), booking.paymentId());
+        assertEquals(List.of(), events);
+        service.holdSeats(bob, "sh", List.of("A1"));
+    }
+
+    @Test
+    void failedCaptureGivesTheDiscountUseBack() {
+        DiscountCode dc = code("ONE", new Discount.Flat(5_000), 0, 1);
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"), "ONE");
+        payments.failNextCapture(new RuntimeException("processor unavailable"));
+
+        assertThrows(RuntimeException.class, () -> service.confirm(alice, booking.id()));
+        assertEquals(0, dc.used());
+    }
+
+    @Test
+    void rejectsConfirmAfterExpiryWithoutContactingTheGateway() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
         clock.advance(TTL);
 
         assertThrows(HoldExpiredException.class, () -> service.confirm(alice, booking.id()));
         assertEquals(BookingStatus.EXPIRED, booking.status());
-        assertEquals(List.of(), payments.charges());
+        assertEquals(0, payments.authorizeAttempts());
     }
 
     @Test
@@ -178,7 +224,7 @@ class BookingServiceTest {
         service.confirm(alice, booking.id());
 
         assertThrows(IllegalBookingStateException.class, () -> service.confirm(alice, booking.id()));
-        assertEquals(1, payments.charges().size());
+        assertEquals(1, payments.captures().size());
     }
 
     @Test
@@ -192,8 +238,8 @@ class BookingServiceTest {
                 secondOutcome.set(t);
             }
         });
-        // Start the second confirm while the first is inside charge(), and wait until it is parked on a monitor.
-        payments.duringCharge(() -> {
+        // Start the second confirm while the first is inside authorize(), and wait until it is parked on a monitor.
+        payments.duringAuthorize(() -> {
             second.start();
             awaitBlocked(second);
         });
@@ -202,9 +248,9 @@ class BookingServiceTest {
         second.join(5_000);
 
         assertInstanceOf(IllegalBookingStateException.class, secondOutcome.get());
-        // Idempotency would hide a second charge here; the booking lock must stop the request reaching the gateway.
-        assertEquals(1, payments.chargeAttempts());
-        assertEquals(List.of(), payments.refunds());
+        // Idempotency would hide a second authorization; the booking lock must stop the request reaching the gateway.
+        assertEquals(1, payments.authorizeAttempts());
+        assertEquals(1, payments.captures().size());
         assertEquals(BookingStatus.CONFIRMED, booking.status());
     }
 
@@ -230,7 +276,7 @@ class BookingServiceTest {
             }
         });
         assertEquals(1, Race.winners(outcomes));
-        assertEquals(1, payments.charges().size());
+        assertEquals(1, payments.captures().size());
     }
 
     @Test
@@ -262,7 +308,7 @@ class BookingServiceTest {
 
         service.confirm(alice, booking.id());
         assertEquals(1, dc.used());
-        assertEquals(15_000, payments.charges().getFirst().amountPaise());
+        assertEquals(15_000, payments.captures().getFirst().amountPaise());
     }
 
     @Test
@@ -308,7 +354,7 @@ class BookingServiceTest {
 
         assertEquals(1, Race.winners(outcomes));
         assertEquals(1, dc.used());
-        assertEquals(1, payments.charges().size());
+        assertEquals(1, payments.captures().size());
         Booking loser = outcomes.get(0) ? b : a;
         assertEquals(BookingStatus.HELD, loser.status());
     }
@@ -327,7 +373,7 @@ class BookingServiceTest {
     void expiryDuringPaymentGivesTheDiscountUseBack() {
         DiscountCode dc = code("ONE", new Discount.Flat(5_000), 0, 1);
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"), "ONE");
-        payments.duringCharge(() -> clock.advance(TTL));
+        payments.duringAuthorize(() -> clock.advance(TTL));
 
         assertThrows(HoldExpiredException.class, () -> service.confirm(alice, booking.id()));
         assertEquals(0, dc.used());
@@ -344,7 +390,7 @@ class BookingServiceTest {
 
         assertEquals(BookingStatus.CANCELLED, booking.status());
         assertEquals(10_000, booking.refundedPaise());
-        assertEquals(List.of(new FakePaymentGateway.Refund("ch_1", 10_000)), payments.refunds());
+        assertEquals(List.of(new FakePaymentGateway.Refund("auth_1", 10_000)), payments.refunds());
         service.holdSeats(bob, "sh", List.of("A1"));
         assertEquals(List.of("confirmed " + booking.id(), "cancelled " + booking.id()), events);
     }

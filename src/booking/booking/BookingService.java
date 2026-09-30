@@ -88,7 +88,7 @@ public final class BookingService {
             requireNotStarted(booking.show(), now);
             if (!now.isBefore(booking.holdExpiresAt())) {
                 inventory.release(booking.id(), booking.seatIds());
-                booking.markExpired(null);
+                booking.markExpired();
                 throw new HoldExpiredException(booking.id());
             }
 
@@ -96,24 +96,36 @@ public final class BookingService {
             if (discount != null && !discount.tryConsume(now)) {
                 throw new DiscountRejectedException(discount.code(), "no longer valid or usage limit reached");
             }
-            String chargeId;
+            String authorizationId;
             try {
-                chargeId = charge(booking);
+                authorizationId = authorize(booking);
             } catch (RuntimeException e) {
                 if (discount != null) discount.releaseUse();
                 throw e;
             }
 
-            // Payment ran outside the show lock, so the hold may have lapsed and the seats gone to someone else.
+            // Authorization ran outside the show lock, so the hold may have lapsed and the seats gone to someone else.
+            // Only funds were reserved, so losing the seats costs the customer nothing.
             try {
                 inventory.confirm(booking.id(), booking.seatIds());
             } catch (HoldExpiredException e) {
                 if (discount != null) discount.releaseUse();
-                booking.markExpired(chargeId);
-                payments.refund(chargeId, booking.price().totalPaise());
+                booking.markExpired();
+                voidAuthorization(authorizationId, e);
                 throw e;
             }
-            booking.markConfirmed(chargeId);
+
+            // Seats are secured; take the money. If that fails, give the seats back rather than keep them unpaid.
+            try {
+                payments.capture(authorizationId);
+            } catch (RuntimeException e) {
+                inventory.cancel(booking.id(), booking.seatIds());
+                if (discount != null) discount.releaseUse();
+                booking.markPaymentFailed();
+                voidAuthorization(authorizationId, e);
+                throw e;
+            }
+            booking.markConfirmed(authorizationId);
         }
         notifyListeners(l -> l.onConfirmed(booking));
         return booking;
@@ -138,9 +150,9 @@ public final class BookingService {
             Instant now = clock.instant();
             requireNotStarted(booking.show(), now);
             long refund = refundPolicy.refundPaise(booking.price().totalPaise(), Duration.between(now, booking.show().startsAt()));
-            String chargeId = booking.chargeId().orElseThrow(() -> new IllegalStateException("confirmed booking " + bookingId + " has no charge"));
+            String paymentId = booking.paymentId().orElseThrow(() -> new IllegalStateException("confirmed booking " + bookingId + " has no payment"));
             // Refund first: if the gateway fails, the booking and its seats are untouched and the cancel can be retried.
-            if (refund > 0) payments.refund(chargeId, refund);
+            if (refund > 0) payments.refund(paymentId, refund);
             inventory.cancel(booking.id(), booking.seatIds());
             booking.markCancelled(refund);
         }
@@ -148,13 +160,23 @@ public final class BookingService {
         return booking;
     }
 
-    private String charge(Booking booking) {
-        // Booking id as idempotency key: a retried confirm for the same booking can't be charged twice.
-        PaymentResult result = payments.charge(booking.id(), booking.user().id(), booking.price().totalPaise());
+    private String authorize(Booking booking) {
+        // Booking id as idempotency key: a retried confirm for the same booking can't reserve funds twice.
+        PaymentResult result = payments.authorize(booking.id(), booking.user().id(), booking.price().totalPaise());
         return switch (result) {
-            case PaymentResult.Approved approved -> approved.chargeId();
+            case PaymentResult.Approved approved -> approved.authorizationId();
             case PaymentResult.Declined declined -> throw new PaymentDeclinedException(booking.id(), declined.reason());
         };
+    }
+
+    // A failed void rides along on the primary exception instead of replacing it. It isn't fatal: an authorization
+    // that is never captured lapses at the bank, so the customer is not charged either way.
+    private void voidAuthorization(String authorizationId, RuntimeException primary) {
+        try {
+            payments.voidAuthorization(authorizationId);
+        } catch (RuntimeException voidFailure) {
+            primary.addSuppressed(voidFailure);
+        }
     }
 
     // Every listener runs even if an earlier one throws; the first failure propagates with the rest suppressed.

@@ -20,7 +20,7 @@ public final class Booking {
     private final Instant holdExpiresAt;
     private final DiscountCode discountCode;
     private BookingStatus status = BookingStatus.HELD;
-    private String chargeId;
+    private String paymentId;
     private long refundedPaise;
 
     Booking(String id, User user, Show show, List<String> seatIds, PriceComponent price, Instant holdExpiresAt, DiscountCode discountCode) {
@@ -65,8 +65,9 @@ public final class Booking {
         return status;
     }
 
-    public synchronized Optional<String> chargeId() {
-        return Optional.ofNullable(chargeId);
+    /** The captured authorization; present only once confirmed. */
+    public synchronized Optional<String> paymentId() {
+        return Optional.ofNullable(paymentId);
     }
 
     public synchronized long refundedPaise() {
@@ -77,15 +78,17 @@ public final class Booking {
         if (!status.canTransitionTo(next)) throw new IllegalBookingStateException(id, status, next);
     }
 
-    synchronized void markConfirmed(String chargeId) {
+    synchronized void markConfirmed(String paymentId) {
         transitionTo(BookingStatus.CONFIRMED);
-        this.chargeId = Objects.requireNonNull(chargeId, "chargeId");
+        this.paymentId = Objects.requireNonNull(paymentId, "paymentId");
     }
 
-    /** {@code chargeId} is recorded even on expiry so a failed refund leaves a trace of the money taken. */
-    synchronized void markExpired(String chargeId) {
+    synchronized void markExpired() {
         transitionTo(BookingStatus.EXPIRED);
-        this.chargeId = chargeId;
+    }
+
+    synchronized void markPaymentFailed() {
+        transitionTo(BookingStatus.PAYMENT_FAILED);
     }
 
     synchronized void markReleased() {

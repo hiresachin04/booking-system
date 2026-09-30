@@ -1,13 +1,13 @@
 package booking.booking;
 
 public enum BookingStatus {
-    HELD, CONFIRMED, RELEASED, EXPIRED, CANCELLED;
+    HELD, CONFIRMED, RELEASED, EXPIRED, PAYMENT_FAILED, CANCELLED;
 
     public boolean canTransitionTo(BookingStatus next) {
         return switch (this) {
-            case HELD -> next == CONFIRMED || next == RELEASED || next == EXPIRED;
+            case HELD -> next == CONFIRMED || next == RELEASED || next == EXPIRED || next == PAYMENT_FAILED;
             case CONFIRMED -> next == CANCELLED;
-            case RELEASED, EXPIRED, CANCELLED -> false;
+            case RELEASED, EXPIRED, PAYMENT_FAILED, CANCELLED -> false;
         };
     }
 }

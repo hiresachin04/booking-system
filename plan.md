@@ -32,7 +32,7 @@ class FlatDiscount     extends PriceDecorator    // -fixed paise, never below 0
 - Rounding is half-up and happens once per decorator: `(amount * bps + 5_000) / 10_000`. The multiply uses `Math.multiplyExact` so an overflow throws instead of wrapping.
 - **Weak spot of Decorator: stacking order changes the result.** A 10% discount applied before a weekend surcharge gives a different total than after it. Callers therefore never stack decorators themselves. `PriceQuoteBuilder` (Builder) owns the order: base → weekend (only if the show's local date in the theater's zone is Sat/Sun) → discount (at most one code). The individual decorators are package-private.
 - Weekend is a surcharge on top of any seat tier (this answers the old Q3). Seat tiers are `REGULAR` and `PREMIUM`.
-- The price is quoted and stored on the `Booking` at hold time. Confirm charges exactly that amount.
+- The price is quoted and stored on the `Booking` at hold time. Confirm authorizes and captures exactly that amount.
 
 ## 2. No double-booking: `ShowInventory`
 - There is one `ShowInventory` per show, holding `Map<SeatId, SeatSlot>`. A slot is `AVAILABLE`, `HELD(holdId, expiresAt)` or `BOOKED(bookingId)`.
@@ -41,12 +41,15 @@ class FlatDiscount     extends PriceDecorator    // -fixed paise, never below 0
 - `confirm(holdId, bookingId)`: under the lock, every seat must still be `HELD` by this `holdId` and not expired. Then all move to `BOOKED`. Otherwise throw `HoldExpiredException`.
 - `release(holdId)` and `cancel(bookingId)` put the seats back to `AVAILABLE`.
 - Expiry is **lazy**. An expired hold counts as available wherever it's read, so correctness never depends on a sweeper thread.
-- Payment runs **outside** the lock: hold (lock) → charge (no lock) → confirm (lock). If the charge succeeds but confirm fails because the hold expired meanwhile, `BookingService` refunds the full amount through the gateway and marks the booking `EXPIRED`.
+- Payment is **two-phase** and the slow step runs **outside** the lock: hold (lock) → authorize funds (no lock) → confirm seats (lock) → capture.
+  - Hold expired during authorization: the authorization is voided and the booking marked `EXPIRED`. No money was taken, so a failed void only delays releasing the customer's funds (an uncaptured authorization lapses on its own). The void failure is attached to the thrown `HoldExpiredException` as suppressed.
+  - Capture fails after the seats were booked: the seats are freed, the discount use is returned, the authorization is voided, and the booking goes to `PAYMENT_FAILED`. The capture error propagates.
+  - Not handled: a capture that *succeeds* at the processor but times out on our side. Settling that needs a payment-status lookup (reconciliation), which the gateway interface doesn't offer yet.
 
 ## 3. Other patterns (only where they earn it)
 | Pattern | Where | Why |
 |---|---|---|
-| State | `BookingStatus` enum with `canTransitionTo`: HELD→CONFIRMED/RELEASED/EXPIRED, CONFIRMED→CANCELLED | All illegal transitions are rejected in one place (`IllegalBookingStateException`). |
+| State | `BookingStatus` enum with `canTransitionTo`: HELD→CONFIRMED/RELEASED/EXPIRED/PAYMENT_FAILED, CONFIRMED→CANCELLED | All illegal transitions are rejected in one place (`IllegalBookingStateException`). |
 | Strategy | `PaymentGateway`, `RefundPolicy` (tiered by hours before show) | Swappable. `FakePaymentGateway` in `test/` is the only fake, because payment is the process boundary. |
 | Facade | `BookingService`: `holdSeats`, `confirm`, `release`, `cancel` | Callers see one API. Inventory, pricing, payment, discounts and listeners stay behind it. |
 | Observer | `BookingListener` (`onConfirmed`, `onCancelled`) registered on `BookingService` | Booking code doesn't know notifications exist. If a listener throws, the exception propagates *after* the state change is committed. It is not swallowed. |
@@ -63,7 +66,7 @@ Discount codes: each code has a validity window, a minimum order, and a total us
 | 0 | Rewrite `plan.md`; add model records | Rejects a show with no price for a tier present in the screen |
 | 1 | Pricing decorators + `PriceQuoteBuilder` | Weekend is decided by the theater's zone, not UTC (Sat 01:00 IST = Fri UTC); half-up rounding boundary (exact .5 paise); percent discount is capped; flat discount never goes below 0; the builder applies surcharge before discount (asserted total) |
 | 2 | `ShowInventory` | Held seat → second hold fails; partial overlap [A1,A2] vs [A2,A3] → loser holds **nothing**; expired hold can be re-held; confirm after expiry fails; confirm with the wrong holdId fails; **20 threads with a `CountDownLatch` start gate race for one seat → exactly 1 succeeds**; overlapping multi-seat races → no seat ends up with two owners |
-| 3 | `BookingStatus` + `BookingService` + `FakePaymentGateway` | Declined payment → booking stays HELD and seats stay held; charge succeeds after hold expiry → refund issued, booking EXPIRED; confirm twice → rejected; hold on a show that has started → rejected; >10 seats → rejected |
+| 3 | `BookingStatus` + `BookingService` + `FakePaymentGateway` | Declined payment → booking stays HELD and seats stay held; authorization succeeds after hold expiry → voided, never captured, booking EXPIRED; capture failure → seats freed, PAYMENT_FAILED; confirm twice → rejected; hold on a show that has started → rejected; >10 seats → rejected |
 | 4 | Discount codes | Expired code / below minimum order → rejected at hold; last use raced by 2 confirms → exactly one gets it |
 | 5 | Cancel + `RefundPolicy` + `BookingListener` | Refund-tier boundary exactly at 24h; cancel after show start → rejected; cancelled seats can be held again; throwing listener → exception propagates and booking is still CONFIRMED |
 
