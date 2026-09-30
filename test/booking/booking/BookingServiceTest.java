@@ -295,10 +295,14 @@ class BookingServiceTest {
         payments.failStatusLookups(2);
         assertThrows(PaymentPendingException.class, () -> service.confirm(alice, booking.id()));
 
-        assertThrows(RuntimeException.class, service::reconcilePendingPayments);
+        ReconciliationReport firstRun = service.reconcilePendingPayments();
+        assertEquals(List.of(booking.id()), firstRun.failures().stream().map(ReconciliationReport.Failure::bookingId).toList());
+        assertEquals("processor unreachable", firstRun.failures().getFirst().error().getMessage());
         assertEquals(BookingStatus.PAYMENT_PENDING, booking.status());
 
-        service.reconcilePendingPayments();
+        ReconciliationReport secondRun = service.reconcilePendingPayments();
+        assertEquals(List.of(booking.id()), secondRun.settledBookingIds());
+        assertEquals(List.of(), secondRun.failures());
         assertEquals(BookingStatus.CONFIRMED, booking.status());
     }
 
@@ -315,7 +319,9 @@ class BookingServiceTest {
 
         // One lookup fails during this run; whichever booking hits it stays pending, the other settles.
         payments.failStatusLookups(1);
-        assertThrows(RuntimeException.class, service::reconcilePendingPayments);
+        ReconciliationReport report = service.reconcilePendingPayments();
+        assertEquals(1, report.failures().size());
+        assertEquals(1, report.settledBookingIds().size());
         assertEquals(1, bookings.findByStatus(BookingStatus.PAYMENT_PENDING).size());
         assertEquals(1, bookings.findByStatus(BookingStatus.CONFIRMED).size());
     }

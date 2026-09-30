@@ -18,6 +18,7 @@ import booking.pricing.PriceQuoteBuilder;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Objects;
@@ -176,12 +177,13 @@ public final class BookingService {
     }
 
     /**
-     * Retries every booking whose capture outcome is still unknown. Meant to run on a schedule. Each booking that
-     * can't be settled yet stays PAYMENT_PENDING for the next run; the first such failure is thrown after all have
-     * been tried, with the rest suppressed.
+     * Retries every booking whose capture outcome is still unknown. Meant to run on a schedule, so it reports
+     * failures instead of throwing them: an exception escaping a scheduled task cancels every later run. A booking
+     * that can't be settled yet stays PAYMENT_PENDING and is retried on the next run.
      */
-    public void reconcilePendingPayments() {
-        RuntimeException failure = null;
+    public ReconciliationReport reconcilePendingPayments() {
+        List<String> settled = new ArrayList<>();
+        List<ReconciliationReport.Failure> failures = new ArrayList<>();
         for (Booking booking : bookings.findByStatus(BookingStatus.PAYMENT_PENDING)) {
             ShowInventory inventory = inventoryOf(booking.show().id());
             synchronized (booking) {
@@ -189,14 +191,14 @@ public final class BookingService {
                 try {
                     settlePendingPayment(booking, inventory);
                 } catch (RuntimeException e) {
-                    if (failure == null) failure = e;
-                    else failure.addSuppressed(e);
+                    failures.add(new ReconciliationReport.Failure(booking.id(), e));
                     continue;
                 }
+                settled.add(booking.id());
                 if (booking.status() == BookingStatus.CONFIRMED) outbox.publish(BookingEventType.CONFIRMED, booking);
             }
         }
-        if (failure != null) throw failure;
+        return new ReconciliationReport(settled, failures);
     }
 
     /**
