@@ -2,7 +2,6 @@ package booking.app;
 
 import booking.booking.BookingConfig;
 import booking.booking.BookingStore;
-import booking.booking.InMemoryStorage;
 import booking.booking.BookingService;
 import booking.booking.RefundPolicy;
 import booking.booking.ShowStore;
@@ -57,8 +56,8 @@ public final class BookingSystem implements AutoCloseable {
     private final BackgroundJobs jobs;
     private final Duration shutdownGrace;
 
-    private BookingSystem(Settings settings, PaymentGateway payments, List<BookingListener> listeners, Clock clock) {
-        this.storage = new InMemoryStorage(clock);
+    private BookingSystem(Settings settings, Storage storage, PaymentGateway payments, List<BookingListener> listeners, Clock clock) {
+        this.storage = Objects.requireNonNull(storage, "storage");
         this.outbox = storage.outbox(listeners, settings.notificationRetry(), settings.sentRetention(), clock);
         this.bookingService = new BookingService(storage, payments, settings.refundPolicy(), settings.booking(), clock, outbox);
         // One thread per job: a slow listener holding up dispatch must not also delay payment reconciliation.
@@ -71,8 +70,10 @@ public final class BookingSystem implements AutoCloseable {
         this.shutdownGrace = settings.shutdownGrace();
     }
 
-    public static BookingSystem start(Settings settings, PaymentGateway payments, List<BookingListener> listeners, Clock clock) {
-        BookingSystem system = new BookingSystem(settings, payments, listeners, clock);
+    /** {@code storage} usually comes from {@link StorageFactory#create}; BookingSystem doesn't choose it. */
+    public static BookingSystem start(Settings settings, Storage storage, PaymentGateway payments, List<BookingListener> listeners,
+                                      Clock clock) {
+        BookingSystem system = new BookingSystem(settings, storage, payments, listeners, clock);
         system.jobs.start();
         return system;
     }

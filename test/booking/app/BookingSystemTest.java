@@ -3,6 +3,7 @@ package booking.app;
 import booking.booking.Booking;
 import booking.booking.BookingConfig;
 import booking.booking.BookingStatus;
+import booking.booking.InMemoryStorage;
 import booking.booking.PaymentPendingException;
 import booking.booking.TieredRefundPolicy;
 import booking.model.User;
@@ -44,7 +45,7 @@ class BookingSystemTest {
     private final BookingSystem system = BookingSystem.start(new BookingSystem.Settings(
                     new BookingConfig(Duration.ofMinutes(10), 10, 0, Duration.ofMinutes(15), BookingConfig.DEFAULT_CAPTURE_RETRY),
                     new TieredRefundPolicy(List.of()), new RetryPolicy(3, TICK), Duration.ofDays(1), TICK, TICK, WAIT),
-            payments, List.of(recorder), clock);
+            new InMemoryStorage(clock), payments, List.of(recorder), clock);
     private final User alice = new User("u1", "Alice");
 
     private Booking confirm(User user, Booking booking) {
