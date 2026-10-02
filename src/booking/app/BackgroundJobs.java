@@ -3,7 +3,7 @@ package booking.app;
 import booking.booking.BookingService;
 import booking.booking.ReconciliationReport;
 import booking.notify.DispatchReport;
-import booking.notify.NotificationOutbox;
+import booking.notify.Outbox;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -25,7 +25,7 @@ public final class BackgroundJobs implements AutoCloseable {
     private final ScheduledJob<ReconciliationReport> reconcile;
     private final List<ScheduledFuture<?>> scheduled = new ArrayList<>();
 
-    public BackgroundJobs(ScheduledExecutorService scheduler, BookingService bookings, NotificationOutbox outbox,
+    public BackgroundJobs(ScheduledExecutorService scheduler, BookingService bookings, Outbox outbox,
                           Duration dispatchEvery, Duration reconcileEvery) {
         this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
         this.dispatchEvery = requirePositive(dispatchEvery, "dispatchEvery");

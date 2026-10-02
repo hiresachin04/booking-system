@@ -9,7 +9,7 @@ import booking.booking.ShowStore;
 import booking.booking.Storage;
 import booking.discount.DiscountStore;
 import booking.notify.BookingListener;
-import booking.notify.NotificationOutbox;
+import booking.notify.Outbox;
 import booking.retry.RetryPolicy;
 import booking.payment.PaymentGateway;
 
@@ -51,7 +51,7 @@ public final class BookingSystem implements AutoCloseable {
     private static final int JOB_THREADS = 2;
 
     private final Storage storage;
-    private final NotificationOutbox outbox;
+    private final Outbox outbox;
     private final BookingService bookingService;
     private final ScheduledExecutorService scheduler;
     private final BackgroundJobs jobs;
@@ -59,7 +59,7 @@ public final class BookingSystem implements AutoCloseable {
 
     private BookingSystem(Settings settings, PaymentGateway payments, List<BookingListener> listeners, Clock clock) {
         this.storage = new InMemoryStorage(clock);
-        this.outbox = new NotificationOutbox(listeners, settings.notificationRetry(), settings.sentRetention(), clock);
+        this.outbox = storage.outbox(listeners, settings.notificationRetry(), settings.sentRetention(), clock);
         this.bookingService = new BookingService(storage, payments, settings.refundPolicy(), settings.booking(), clock, outbox);
         // One thread per job: a slow listener holding up dispatch must not also delay payment reconciliation.
         this.scheduler = Executors.newScheduledThreadPool(JOB_THREADS, r -> {
@@ -93,7 +93,7 @@ public final class BookingSystem implements AutoCloseable {
         return storage.discounts();
     }
 
-    public NotificationOutbox outbox() {
+    public Outbox outbox() {
         return outbox;
     }
 

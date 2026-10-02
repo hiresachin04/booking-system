@@ -1,6 +1,13 @@
 package booking.booking;
 
 import booking.discount.DiscountStore;
+import booking.notify.BookingListener;
+import booking.notify.Outbox;
+import booking.retry.RetryPolicy;
+
+import java.time.Clock;
+import java.time.Duration;
+import java.util.List;
 
 /** One consistent set of stores for a BookingService; StorageFactory picks in-memory or PostgreSQL. */
 public interface Storage {
@@ -11,4 +18,9 @@ public interface Storage {
     DiscountStore discounts();
 
     BookingLocks locks();
+
+    Transactions transactions();
+
+    /** The outbox kept by this storage, so its entries are written in the same transactions as bookings. */
+    Outbox outbox(List<BookingListener> listeners, RetryPolicy retry, Duration sentRetention, Clock clock);
 }

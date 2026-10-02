@@ -18,7 +18,7 @@ import java.util.UUID;
  * once {@code sentRetention} has passed, so the outbox doesn't grow with every booking ever made; FAILED ones are
  * kept because they still need someone's attention.
  */
-public final class NotificationOutbox {
+public final class NotificationOutbox implements Outbox {
     private final List<BookingListener> listeners;
     private final RetryPolicy retry;
     private final Duration sentRetention;
@@ -36,6 +36,7 @@ public final class NotificationOutbox {
         this.clock = Objects.requireNonNull(clock, "clock");
     }
 
+    @Override
     public void publish(BookingEventType type, Booking booking) {
         Instant now = clock.instant();
         BookingEvent event = new BookingEvent(UUID.randomUUID().toString(), type, booking);
@@ -48,6 +49,7 @@ public final class NotificationOutbox {
      * Attempts every entry that is due. Meant to run on a schedule. Never throws for a listener failure: that is
      * recorded on the entry and retried, so one bad listener can't stop the schedule.
      */
+    @Override
     public DispatchReport dispatchDue() {
         synchronized (dispatchLock) {
             Instant now = clock.instant();
