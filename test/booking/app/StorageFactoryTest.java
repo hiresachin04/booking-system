@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.Map;
 import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -26,7 +27,7 @@ class StorageFactoryTest {
 
     @Test
     void committedConfigSelectsInMemoryStorage() {
-        assertInstanceOf(InMemoryStorage.class, StorageFactory.create(StorageFactory.load(COMMITTED_CONFIG), clock));
+        assertInstanceOf(InMemoryStorage.class, StorageFactory.create(StorageFactory.load(COMMITTED_CONFIG), Map.of(), clock));
     }
 
     @Test
@@ -39,24 +40,30 @@ class StorageFactoryTest {
 
     @Test
     void toleratesSurroundingWhitespace() {
-        assertInstanceOf(InMemoryStorage.class, StorageFactory.create(storage("  in-memory "), clock));
+        assertInstanceOf(InMemoryStorage.class, StorageFactory.create(storage("  in-memory "), Map.of(), clock));
     }
 
     @Test
     void refusesToStartWhenStorageIsNotSet() {
-        IllegalStateException e = assertThrows(IllegalStateException.class, () -> StorageFactory.create(new Properties(), clock));
-        assertEquals("storage is not set; expected in-memory", e.getMessage());
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> StorageFactory.create(new Properties(), Map.of(), clock));
+        assertEquals("storage is not set; expected in-memory or postgres", e.getMessage());
     }
 
     @Test
     void refusesABlankStorage() {
-        assertThrows(IllegalStateException.class, () -> StorageFactory.create(storage("   "), clock));
+        assertThrows(IllegalStateException.class, () -> StorageFactory.create(storage("   "), Map.of(), clock));
     }
 
     @Test
     void refusesAnUnknownStorageAndNamesTheValue() {
-        IllegalStateException e = assertThrows(IllegalStateException.class, () -> StorageFactory.create(storage("in_memory"), clock));
-        assertEquals("storage=in_memory is not supported; expected in-memory", e.getMessage());
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> StorageFactory.create(storage("in_memory"), Map.of(), clock));
+        assertEquals("storage=in_memory is not supported; expected in-memory or postgres", e.getMessage());
+    }
+
+    @Test
+    void postgresWithoutConnectionSettingsNamesTheMissingOne() {
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> StorageFactory.create(storage("postgres"), Map.of(), clock));
+        assertEquals("postgres.url is not set", e.getMessage());
     }
 
     @Test
