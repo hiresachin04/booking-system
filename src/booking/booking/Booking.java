@@ -41,6 +41,35 @@ public final class Booking {
         this.checkout = Objects.requireNonNull(checkout, "checkout");
     }
 
+    /** The mutable part of a booking, so a store can save it and later {@link #restore} it exactly. */
+    record State(BookingStatus status, String paymentId, Instant paymentPendingSince, int captureAttempts, Instant nextCaptureAt,
+                 boolean captureGivenUp, long refundedPaise) {
+        State {
+            Objects.requireNonNull(status, "status");
+        }
+    }
+
+    /**
+     * Rebuilds a saved booking. It sets the state directly rather than replaying transitions: the saved state already
+     * passed the transition rules when it was reached.
+     */
+    static Booking restore(String id, User user, Show show, List<String> seatIds, PriceComponent price, Instant holdExpiresAt,
+                           String discountCode, CheckoutSession checkout, State state) {
+        Booking booking = new Booking(id, user, show, seatIds, price, holdExpiresAt, discountCode, checkout);
+        booking.status = state.status();
+        booking.paymentId = state.paymentId();
+        booking.paymentPendingSince = state.paymentPendingSince();
+        booking.captureAttempts = state.captureAttempts();
+        booking.nextCaptureAt = state.nextCaptureAt();
+        booking.captureGivenUp = state.captureGivenUp();
+        booking.refundedPaise = state.refundedPaise();
+        return booking;
+    }
+
+    synchronized State state() {
+        return new State(status, paymentId, paymentPendingSince, captureAttempts, nextCaptureAt, captureGivenUp, refundedPaise);
+    }
+
     public String id() {
         return id;
     }
