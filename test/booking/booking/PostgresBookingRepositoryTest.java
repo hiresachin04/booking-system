@@ -42,8 +42,7 @@ class PostgresBookingRepositoryTest extends BookingStoreContract {
 
     @Test
     void handsOutAFreshCopyOnEveryFind() {
-        Booking stored = BookingStoreContractSupport.saveSample(bookings, new PostgresShowRepository(test.database(),
-                new MutableClock(Instant.parse("2026-10-01T06:30:00Z"))));
+        Booking stored = TestBookings.saveHeld(shows, bookings, Instant.parse("2026-10-01T06:30:00Z"));
 
         assertNotSame(bookings.find(stored.id()).orElseThrow(), bookings.find(stored.id()).orElseThrow());
     }

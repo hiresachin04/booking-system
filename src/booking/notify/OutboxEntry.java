@@ -26,6 +26,10 @@ public final class OutboxEntry {
         return event;
     }
 
+    public String listener() {
+        return listener.name();
+    }
+
     public synchronized DeliveryStatus status() {
         return status;
     }

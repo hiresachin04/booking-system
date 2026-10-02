@@ -30,7 +30,7 @@ class BookingRepositoryTest extends BookingStoreContract {
 
     @Test
     void handsOutTheOneStoredInstance() {
-        BookingStoreContractSupport.saveSample(storage.bookings(), storage.shows());
+        TestBookings.saveHeld(storage.shows(), storage.bookings(), Instant.parse("2026-10-01T06:30:00Z"));
         BookingRepository bookings = storage.bookings();
         Booking first = bookings.findByStatus(BookingStatus.HELD).getFirst();
 
@@ -39,7 +39,7 @@ class BookingRepositoryTest extends BookingStoreContract {
 
     @Test
     void rejectsUpdatingACopyOfAStoredBooking() {
-        Booking stored = BookingStoreContractSupport.saveSample(storage.bookings(), storage.shows());
+        Booking stored = TestBookings.saveHeld(storage.shows(), storage.bookings(), Instant.parse("2026-10-01T06:30:00Z"));
         Booking copy = Booking.restore(stored.id(), stored.user(), stored.show(), stored.seatIds(), stored.price(),
                 stored.holdExpiresAt(), null, stored.checkout(), stored.state());
 
