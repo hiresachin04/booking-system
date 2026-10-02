@@ -647,10 +647,13 @@ class BookingServiceTest {
     @Test
     void secondConfirmArrivingMidPaymentWaitsAndIsRejected() throws Exception {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        // Paid up front: the fake's simulateCheckout is synchronized, so calling it from the second thread would
+        // park that thread inside the fake rather than on the booking lock this test is about.
+        CheckoutResult paid = payments.simulateCheckout(booking.checkout());
         AtomicReference<Throwable> secondOutcome = new AtomicReference<>();
         Thread second = new Thread(() -> {
             try {
-                confirm(alice, booking);
+                service.confirm(alice, booking.id(), paid);
             } catch (Throwable t) {
                 secondOutcome.set(t);
             }
@@ -661,7 +664,7 @@ class BookingServiceTest {
             awaitBlocked(second);
         });
 
-        confirm(alice, booking);
+        service.confirm(alice, booking.id(), paid);
         second.join(5_000);
 
         assertInstanceOf(IllegalBookingStateException.class, secondOutcome.get());
