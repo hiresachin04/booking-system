@@ -19,7 +19,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * all-or-nothing, and per-seat locks would need globally ordered acquisition to do that without deadlock.
  * Expiry is evaluated on read, so a stale HELD slot never blocks anyone and no sweeper is needed.
  */
-public final class ShowInventory {
+public final class ShowInventory implements SeatInventory {
     private sealed interface Slot {}
 
     private record Available() implements Slot {}

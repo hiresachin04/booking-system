@@ -36,8 +36,9 @@ class RazorpayBookingFlowTest {
     private static final Duration RAZORPAY_EXPIRY = Duration.ofMinutes(12);
 
     private final MutableClock clock = new MutableClock(NOW);
-    private final ShowRepository shows = new ShowRepository(clock);
-    private final DiscountRegistry discounts = new DiscountRegistry();
+    private final InMemoryStorage storage = new InMemoryStorage(clock);
+    private final ShowRepository shows = storage.shows();
+    private final DiscountRegistry discounts = storage.discounts();
     private final FakePaymentGateway razorpay = FakePaymentGateway.razorpay(clock, RAZORPAY_EXPIRY);
     private final List<String> events = new ArrayList<>();
     private final NotificationOutbox outbox = new NotificationOutbox(List.of(new BookingListener() {
@@ -56,7 +57,7 @@ class RazorpayBookingFlowTest {
             events.add("refunded");
         }
     }), new RetryPolicy(3, Duration.ofSeconds(30)), Duration.ofDays(1), clock);
-    private final BookingService service = new BookingService(shows, new BookingRepository(), discounts, razorpay,
+    private final BookingService service = new BookingService(storage, razorpay,
             new TieredRefundPolicy(List.of()), new BookingConfig(TTL, 10, 0, MAX_PENDING, BookingConfig.DEFAULT_CAPTURE_RETRY),
             clock, outbox);
     private final ShowInventory inventory = shows.add(Fixtures.show("sh", NOW.plus(Duration.ofHours(8))));

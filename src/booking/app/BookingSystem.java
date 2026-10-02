@@ -1,10 +1,12 @@
 package booking.app;
 
 import booking.booking.BookingConfig;
-import booking.booking.BookingRepository;
+import booking.booking.BookingStore;
+import booking.booking.InMemoryStorage;
 import booking.booking.BookingService;
 import booking.booking.RefundPolicy;
-import booking.booking.ShowRepository;
+import booking.booking.ShowStore;
+import booking.booking.Storage;
 import booking.discount.DiscountRegistry;
 import booking.notify.BookingListener;
 import booking.notify.NotificationOutbox;
@@ -48,9 +50,7 @@ public final class BookingSystem implements AutoCloseable {
 
     private static final int JOB_THREADS = 2;
 
-    private final ShowRepository shows;
-    private final BookingRepository bookings;
-    private final DiscountRegistry discounts;
+    private final Storage storage;
     private final NotificationOutbox outbox;
     private final BookingService bookingService;
     private final ScheduledExecutorService scheduler;
@@ -58,11 +58,9 @@ public final class BookingSystem implements AutoCloseable {
     private final Duration shutdownGrace;
 
     private BookingSystem(Settings settings, PaymentGateway payments, List<BookingListener> listeners, Clock clock) {
-        this.shows = new ShowRepository(clock);
-        this.bookings = new BookingRepository();
-        this.discounts = new DiscountRegistry();
+        this.storage = new InMemoryStorage(clock);
         this.outbox = new NotificationOutbox(listeners, settings.notificationRetry(), settings.sentRetention(), clock);
-        this.bookingService = new BookingService(shows, bookings, discounts, payments, settings.refundPolicy(), settings.booking(), clock, outbox);
+        this.bookingService = new BookingService(storage, payments, settings.refundPolicy(), settings.booking(), clock, outbox);
         // One thread per job: a slow listener holding up dispatch must not also delay payment reconciliation.
         this.scheduler = Executors.newScheduledThreadPool(JOB_THREADS, r -> {
             Thread t = new Thread(r, "booking-jobs");
@@ -83,16 +81,16 @@ public final class BookingSystem implements AutoCloseable {
         return bookingService;
     }
 
-    public ShowRepository shows() {
-        return shows;
+    public ShowStore shows() {
+        return storage.shows();
     }
 
-    public BookingRepository bookings() {
-        return bookings;
+    public BookingStore bookings() {
+        return storage.bookings();
     }
 
     public DiscountRegistry discounts() {
-        return discounts;
+        return storage.discounts();
     }
 
     public NotificationOutbox outbox() {

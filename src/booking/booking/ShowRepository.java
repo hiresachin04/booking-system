@@ -1,5 +1,6 @@
 package booking.booking;
 
+import booking.inventory.SeatInventory;
 import booking.inventory.ShowInventory;
 import booking.model.Show;
 
@@ -9,7 +10,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
-public final class ShowRepository {
+public final class ShowRepository implements ShowStore {
     private final Clock clock;
     private final Map<String, ShowInventory> inventories = new ConcurrentHashMap<>();
 
@@ -17,6 +18,7 @@ public final class ShowRepository {
         this.clock = Objects.requireNonNull(clock, "clock");
     }
 
+    @Override
     public ShowInventory add(Show show) {
         ShowInventory inventory = new ShowInventory(show, clock);
         if (inventories.putIfAbsent(show.id(), inventory) != null) {
@@ -25,7 +27,8 @@ public final class ShowRepository {
         return inventory;
     }
 
-    public Optional<ShowInventory> find(String showId) {
-        return Optional.ofNullable(inventories.get(showId));
+    @Override
+    public Optional<SeatInventory> find(String showId) {
+        return Optional.<SeatInventory>ofNullable(inventories.get(showId));
     }
 }

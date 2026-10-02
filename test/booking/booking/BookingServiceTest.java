@@ -48,9 +48,10 @@ class BookingServiceTest {
     private static final RetryPolicy CAPTURE_RETRY = new RetryPolicy(3, Duration.ofSeconds(30));
 
     private final MutableClock clock = new MutableClock(NOW);
-    private final ShowRepository shows = new ShowRepository(clock);
-    private final BookingRepository bookings = new BookingRepository();
-    private final DiscountRegistry discounts = new DiscountRegistry();
+    private final InMemoryStorage storage = new InMemoryStorage(clock);
+    private final ShowRepository shows = storage.shows();
+    private final BookingRepository bookings = storage.bookings();
+    private final DiscountRegistry discounts = storage.discounts();
     private final FakePaymentGateway payments = new FakePaymentGateway();
     private final RefundPolicy refundPolicy = new TieredRefundPolicy(List.of(
             new TieredRefundPolicy.Tier(Duration.ofHours(24), 10_000),
@@ -84,7 +85,7 @@ class BookingServiceTest {
     };
 
     private BookingService service(NotificationOutbox outbox) {
-        return new BookingService(shows, bookings, discounts, payments, refundPolicy,
+        return new BookingService(storage, payments, refundPolicy,
                 new BookingConfig(TTL, MAX_SEATS, 1_000, MAX_PENDING, CAPTURE_RETRY), clock, outbox);
     }
 

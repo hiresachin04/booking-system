@@ -2,12 +2,10 @@ package booking.payment;
 
 import booking.booking.Booking;
 import booking.booking.BookingConfig;
-import booking.booking.BookingRepository;
 import booking.booking.BookingService;
 import booking.booking.BookingStatus;
-import booking.booking.ShowRepository;
+import booking.booking.InMemoryStorage;
 import booking.booking.TieredRefundPolicy;
-import booking.discount.DiscountRegistry;
 import booking.model.User;
 import booking.notify.NotificationOutbox;
 import booking.retry.RetryPolicy;
@@ -262,9 +260,9 @@ class RazorpayPaymentGatewayTest {
 
     @Test
     void booksAndCapturesThroughTheAdapterEvenWhenTheCaptureResponseIsLost() {
-        ShowRepository shows = new ShowRepository(clock);
-        shows.add(Fixtures.show("sh", NOW.plus(Duration.ofHours(8))));
-        BookingService service = new BookingService(shows, new BookingRepository(), new DiscountRegistry(), gateway,
+        InMemoryStorage storage = new InMemoryStorage(clock);
+        storage.shows().add(Fixtures.show("sh", NOW.plus(Duration.ofHours(8))));
+        BookingService service = new BookingService(storage, gateway,
                 new TieredRefundPolicy(List.of()), new BookingConfig(Duration.ofMinutes(10), 10, 0, Duration.ofMinutes(15),
                 BookingConfig.DEFAULT_CAPTURE_RETRY), clock,
                 new NotificationOutbox(List.of(), new RetryPolicy(3, Duration.ofSeconds(30)), Duration.ofDays(1), clock));

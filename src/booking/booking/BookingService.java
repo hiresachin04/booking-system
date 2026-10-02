@@ -4,7 +4,7 @@ import booking.discount.DiscountCode;
 import booking.discount.DiscountRegistry;
 import booking.discount.DiscountRejectedException;
 import booking.inventory.HoldExpiredException;
-import booking.inventory.ShowInventory;
+import booking.inventory.SeatInventory;
 import booking.model.Seat;
 import booking.model.Show;
 import booking.model.User;
@@ -27,22 +27,26 @@ import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.function.Function;
 
 public final class BookingService {
-    private final ShowRepository shows;
-    private final BookingRepository bookings;
+    private final ShowStore shows;
+    private final BookingStore bookings;
     private final DiscountRegistry discounts;
+    private final BookingLocks locks;
     private final PaymentGateway payments;
     private final RefundPolicy refundPolicy;
     private final BookingConfig config;
     private final Clock clock;
     private final NotificationOutbox outbox;
 
-    public BookingService(ShowRepository shows, BookingRepository bookings, DiscountRegistry discounts, PaymentGateway payments,
-                          RefundPolicy refundPolicy, BookingConfig config, Clock clock, NotificationOutbox outbox) {
-        this.shows = Objects.requireNonNull(shows, "shows");
-        this.bookings = Objects.requireNonNull(bookings, "bookings");
-        this.discounts = Objects.requireNonNull(discounts, "discounts");
+    public BookingService(Storage storage, PaymentGateway payments, RefundPolicy refundPolicy, BookingConfig config, Clock clock,
+                          NotificationOutbox outbox) {
+        Objects.requireNonNull(storage, "storage");
+        this.shows = Objects.requireNonNull(storage.shows(), "shows");
+        this.bookings = Objects.requireNonNull(storage.bookings(), "bookings");
+        this.discounts = Objects.requireNonNull(storage.discounts(), "discounts");
+        this.locks = Objects.requireNonNull(storage.locks(), "locks");
         this.payments = Objects.requireNonNull(payments, "payments");
         this.refundPolicy = Objects.requireNonNull(refundPolicy, "refundPolicy");
         this.config = Objects.requireNonNull(config, "config");
@@ -63,7 +67,7 @@ public final class BookingService {
         if (seatIds.size() > config.maxSeatsPerBooking()) {
             throw new IllegalArgumentException("at most " + config.maxSeatsPerBooking() + " seats per booking, got " + seatIds.size());
         }
-        ShowInventory inventory = inventoryOf(showId);
+        SeatInventory inventory = inventoryOf(showId);
         Show show = inventory.show();
         Instant now = clock.instant();
         requireNotStarted(show, now);
@@ -99,9 +103,9 @@ public final class BookingService {
     /** Called with what the customer's browser returned after paying for {@link Booking#checkout()}. */
     public Booking confirm(User user, String bookingId, CheckoutResult checkoutResult) {
         Objects.requireNonNull(checkoutResult, "checkoutResult");
-        Booking booking = ownedBy(user, bookingId);
-        ShowInventory inventory = inventoryOf(booking.show().id());
-        synchronized (booking) {
+        ownedBy(user, bookingId);
+        return underLock(bookingId, booking -> {
+            SeatInventory inventory = inventoryOf(booking.show().id());
             booking.requireCanTransitionTo(BookingStatus.CONFIRMED);
             Instant now = clock.instant();
             requireNotStarted(booking.show(), now);
@@ -163,25 +167,25 @@ public final class BookingService {
             if (booking.status() != BookingStatus.CONFIRMED) booking.markConfirmed(authorizationId);
             // Recorded in the same step as the state change; delivery happens later and can't fail this call.
             outbox.publish(BookingEventType.CONFIRMED, booking);
-        }
-        return booking;
+            return booking;
+        });
     }
 
     public Booking release(User user, String bookingId) {
-        Booking booking = ownedBy(user, bookingId);
-        ShowInventory inventory = inventoryOf(booking.show().id());
-        synchronized (booking) {
+        ownedBy(user, bookingId);
+        return underLock(bookingId, booking -> {
+            SeatInventory inventory = inventoryOf(booking.show().id());
             booking.requireCanTransitionTo(BookingStatus.RELEASED);
             inventory.release(booking.id(), booking.seatIds());
             booking.markReleased();
-        }
-        return booking;
+            return booking;
+        });
     }
 
     public Booking cancel(User user, String bookingId) {
-        Booking booking = ownedBy(user, bookingId);
-        ShowInventory inventory = inventoryOf(booking.show().id());
-        synchronized (booking) {
+        ownedBy(user, bookingId);
+        return underLock(bookingId, booking -> {
+            SeatInventory inventory = inventoryOf(booking.show().id());
             booking.requireCanTransitionTo(BookingStatus.CANCELLED);
             Instant now = clock.instant();
             requireNotStarted(booking.show(), now);
@@ -192,8 +196,8 @@ public final class BookingService {
             inventory.cancel(booking.id(), booking.seatIds());
             booking.markCancelled(refund);
             outbox.publish(BookingEventType.CANCELLED, booking);
-        }
-        return booking;
+            return booking;
+        });
     }
 
     private String verifyPayment(Booking booking, CheckoutResult checkoutResult) {
@@ -233,11 +237,11 @@ public final class BookingService {
         List<String> seatsReleased = new ArrayList<>();
         List<String> awaitingExpiry = new ArrayList<>();
         List<ReconciliationReport.Failure> failures = new ArrayList<>();
-        for (Booking booking : open) {
-            ShowInventory inventory = inventoryOf(booking.show().id());
-            synchronized (booking) {
+        for (Booking listed : open) {
+            underLock(listed.id(), booking -> {
+                SeatInventory inventory = inventoryOf(booking.show().id());
                 BookingStatus before = booking.status();
-                if (before != BookingStatus.PAYMENT_PENDING && before != BookingStatus.PAYMENT_UNRESOLVED) continue;
+                if (before != BookingStatus.PAYMENT_PENDING && before != BookingStatus.PAYMENT_UNRESOLVED) return null;
                 Progress progress = Progress.WAITING;
                 try {
                     progress = advancePayment(booking, inventory);
@@ -255,7 +259,8 @@ public final class BookingService {
                         if (releaseSeatsIfStuck(booking, inventory)) seatsReleased.add(booking.id());
                     }
                 }
-            }
+                return null;
+            });
         }
         return new ReconciliationReport(settled, seatsReleased, awaitingExpiry, failures);
     }
@@ -277,7 +282,7 @@ public final class BookingService {
      * processor can't be reached, or a capture, void or refund call fails, this throws. The failed capture is recorded
      * for the retry schedule; nothing else changes.
      */
-    private Progress advancePayment(Booking booking, ShowInventory inventory) {
+    private Progress advancePayment(Booking booking, SeatInventory inventory) {
         String authorizationId = booking.paymentId().orElseThrow();
         boolean holdsSeats = booking.status() == BookingStatus.PAYMENT_PENDING;
         PaymentStatus status = payments.status(authorizationId);
@@ -329,7 +334,7 @@ public final class BookingService {
     }
 
     /** Puts a PAYMENT_PENDING booking's seats back on sale once retrying is over; returns whether it did. */
-    private boolean releaseSeatsIfStuck(Booking booking, ShowInventory inventory) {
+    private boolean releaseSeatsIfStuck(Booking booking, SeatInventory inventory) {
         if (booking.status() != BookingStatus.PAYMENT_PENDING) return false;
         if (!booking.captureGivenUp() && clock.instant().isBefore(pendingDeadline(booking))) return false;
         inventory.cancel(booking.id(), booking.seatIds());
@@ -353,6 +358,29 @@ public final class BookingService {
         }
     }
 
+    /**
+     * Runs {@code work} on the stored booking while holding its lock, then saves the state it reached even if it
+     * threw: changes made before a failure (EXPIRED, PAYMENT_PENDING, a recorded capture attempt) are real.
+     */
+    private <T> T underLock(String bookingId, Function<Booking, T> work) {
+        return locks.withLock(bookingId, () -> {
+            Booking booking = bookings.find(bookingId).orElseThrow(() -> new NoSuchElementException("no booking " + bookingId));
+            T result;
+            try {
+                result = work.apply(booking);
+            } catch (RuntimeException e) {
+                try {
+                    bookings.update(booking);
+                } catch (RuntimeException saveFailure) {
+                    e.addSuppressed(saveFailure);
+                }
+                throw e;
+            }
+            bookings.update(booking);
+            return result;
+        });
+    }
+
     // Someone else's booking reads as missing rather than forbidden, so booking ids can't be probed.
     private Booking ownedBy(User user, String bookingId) {
         return bookings.find(bookingId)
@@ -360,7 +388,7 @@ public final class BookingService {
                 .orElseThrow(() -> new NoSuchElementException("no booking " + bookingId));
     }
 
-    private ShowInventory inventoryOf(String showId) {
+    private SeatInventory inventoryOf(String showId) {
         return shows.find(showId).orElseThrow(() -> new NoSuchElementException("no show " + showId));
     }
 
