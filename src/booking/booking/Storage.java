@@ -1,6 +1,6 @@
 package booking.booking;
 
-import booking.discount.DiscountRegistry;
+import booking.discount.DiscountStore;
 
 /** One consistent set of stores for a BookingService; StorageFactory picks in-memory or PostgreSQL. */
 public interface Storage {
@@ -8,7 +8,7 @@ public interface Storage {
 
     BookingStore bookings();
 
-    DiscountRegistry discounts();
+    DiscountStore discounts();
 
     BookingLocks locks();
 }

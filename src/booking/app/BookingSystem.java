@@ -7,7 +7,7 @@ import booking.booking.BookingService;
 import booking.booking.RefundPolicy;
 import booking.booking.ShowStore;
 import booking.booking.Storage;
-import booking.discount.DiscountRegistry;
+import booking.discount.DiscountStore;
 import booking.notify.BookingListener;
 import booking.notify.NotificationOutbox;
 import booking.retry.RetryPolicy;
@@ -89,7 +89,7 @@ public final class BookingSystem implements AutoCloseable {
         return storage.bookings();
     }
 
-    public DiscountRegistry discounts() {
+    public DiscountStore discounts() {
         return storage.discounts();
     }
 

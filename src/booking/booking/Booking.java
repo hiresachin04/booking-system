@@ -1,6 +1,5 @@
 package booking.booking;
 
-import booking.discount.DiscountCode;
 import booking.model.Show;
 import booking.payment.CheckoutSession;
 import booking.model.User;
@@ -20,7 +19,7 @@ public final class Booking {
     private final List<String> seatIds;
     private final PriceComponent price;
     private final Instant holdExpiresAt;
-    private final DiscountCode discountCode;
+    private final String discountCode;
     private final CheckoutSession checkout;
     private BookingStatus status = BookingStatus.HELD;
     private String paymentId;
@@ -30,7 +29,7 @@ public final class Booking {
     private boolean captureGivenUp;
     private long refundedPaise;
 
-    Booking(String id, User user, Show show, List<String> seatIds, PriceComponent price, Instant holdExpiresAt, DiscountCode discountCode,
+    Booking(String id, User user, Show show, List<String> seatIds, PriceComponent price, Instant holdExpiresAt, String discountCode,
             CheckoutSession checkout) {
         this.id = Objects.requireNonNull(id, "id");
         this.user = Objects.requireNonNull(user, "user");
@@ -71,7 +70,8 @@ public final class Booking {
         return checkout;
     }
 
-    public Optional<DiscountCode> discountCode() {
+    /** The code applied to {@link #price()}; its uses are counted by the DiscountStore, not here. */
+    public Optional<String> discountCode() {
         return Optional.ofNullable(discountCode);
     }
 

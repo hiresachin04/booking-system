@@ -17,6 +17,14 @@ public final class DiscountCode {
     private final AtomicInteger used = new AtomicInteger();
 
     public DiscountCode(String code, Discount discount, Instant validFrom, Instant validUntil, long minOrderPaise, int usageLimit) {
+        this(code, discount, validFrom, validUntil, minOrderPaise, usageLimit, 0);
+    }
+
+    /** For stores that keep the count elsewhere and rebuild a snapshot with the uses taken so far. */
+    public DiscountCode(String code, Discount discount, Instant validFrom, Instant validUntil, long minOrderPaise, int usageLimit,
+                        int used) {
+        if (used < 0 || used > usageLimit) throw new IllegalArgumentException("used must be within 0.." + usageLimit + ": " + used);
+        this.used.set(used);
         this.code = Objects.requireNonNull(code, "code");
         this.discount = Objects.requireNonNull(discount, "discount");
         this.validFrom = Objects.requireNonNull(validFrom, "validFrom");
@@ -34,6 +42,22 @@ public final class DiscountCode {
 
     public Discount discount() {
         return discount;
+    }
+
+    public Instant validFrom() {
+        return validFrom;
+    }
+
+    public Instant validUntil() {
+        return validUntil;
+    }
+
+    public long minOrderPaise() {
+        return minOrderPaise;
+    }
+
+    public int usageLimit() {
+        return usageLimit;
     }
 
     public int used() {

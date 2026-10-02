@@ -52,6 +52,42 @@ class DiscountCodeTest {
     }
 
     @Test
+    void registryRefusesToConsumeAnUnknownCode() {
+        DiscountRegistry registry = new DiscountRegistry();
+        assertFalse(registry.tryConsume("NOPE", FROM));
+    }
+
+    @Test
+    void registryConsumesThroughTheCodesOwnCounter() {
+        DiscountRegistry registry = new DiscountRegistry();
+        registry.add(code);
+
+        assertTrue(registry.tryConsume("FEST", FROM));
+        assertTrue(registry.tryConsume("FEST", FROM));
+        assertFalse(registry.tryConsume("FEST", FROM));
+        registry.releaseUse("FEST");
+        assertEquals(1, code.used());
+    }
+
+    @Test
+    void registryRejectsReleasingAUseOfAnUnknownCode() {
+        assertThrows(IllegalStateException.class, () -> new DiscountRegistry().releaseUse("NOPE"));
+    }
+
+    @Test
+    void snapshotWithUsesAlreadyTakenStartsFromThatCount() {
+        DiscountCode restored = new DiscountCode("FEST", new Discount.Flat(5_000), FROM, UNTIL, 0, 2, 2);
+
+        assertEquals(2, restored.used());
+        assertFalse(restored.tryConsume(FROM));
+    }
+
+    @Test
+    void snapshotRejectsMoreUsesThanTheLimit() {
+        assertThrows(IllegalArgumentException.class, () -> new DiscountCode("FEST", new Discount.Flat(5_000), FROM, UNTIL, 0, 2, 3));
+    }
+
+    @Test
     void registryRejectsDuplicateCode() {
         DiscountRegistry registry = new DiscountRegistry();
         registry.add(code);

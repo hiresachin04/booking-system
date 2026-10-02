@@ -1,7 +1,7 @@
 package booking.booking;
 
 import booking.discount.DiscountCode;
-import booking.discount.DiscountRegistry;
+import booking.discount.DiscountStore;
 import booking.discount.DiscountRejectedException;
 import booking.inventory.HoldExpiredException;
 import booking.inventory.SeatInventory;
@@ -32,7 +32,7 @@ import java.util.function.Function;
 public final class BookingService {
     private final ShowStore shows;
     private final BookingStore bookings;
-    private final DiscountRegistry discounts;
+    private final DiscountStore discounts;
     private final BookingLocks locks;
     private final PaymentGateway payments;
     private final RefundPolicy refundPolicy;
@@ -76,9 +76,8 @@ public final class BookingService {
                 .map(id -> show.screen().seat(id).orElseThrow(() -> new IllegalArgumentException("seat " + id + " is not in show " + showId)))
                 .toList();
         PriceQuoteBuilder quote = new PriceQuoteBuilder(show, seats).weekendSurchargeBps(config.weekendSurchargeBps());
-        DiscountCode discount = null;
         if (code != null) {
-            discount = discounts.find(code).orElseThrow(() -> new DiscountRejectedException(code, "unknown code"));
+            DiscountCode discount = discounts.find(code).orElseThrow(() -> new DiscountRejectedException(code, "unknown code"));
             discount.checkApplicable(quote.build().totalPaise(), now);
             quote.discount(discount.discount());
         }
@@ -95,7 +94,7 @@ public final class BookingService {
             inventory.release(bookingId, seatIds);
             throw e;
         }
-        Booking booking = new Booking(bookingId, user, show, seatIds, price, expiresAt, discount, checkout);
+        Booking booking = new Booking(bookingId, user, show, seatIds, price, expiresAt, code, checkout);
         bookings.save(booking);
         return booking;
     }
@@ -118,15 +117,15 @@ public final class BookingService {
                 throw expired;
             }
 
-            DiscountCode discount = booking.discountCode().orElse(null);
-            if (discount != null && !discount.tryConsume(now)) {
-                throw new DiscountRejectedException(discount.code(), "no longer valid or usage limit reached");
+            String discount = booking.discountCode().orElse(null);
+            if (discount != null && !discounts.tryConsume(discount, now)) {
+                throw new DiscountRejectedException(discount, "no longer valid or usage limit reached");
             }
             String authorizationId;
             try {
                 authorizationId = verifyPayment(booking, checkoutResult);
             } catch (RuntimeException e) {
-                if (discount != null) discount.releaseUse();
+                if (discount != null) discounts.releaseUse(discount);
                 throw e;
             }
 
@@ -135,7 +134,7 @@ public final class BookingService {
             try {
                 inventory.confirm(booking.id(), booking.seatIds());
             } catch (HoldExpiredException e) {
-                if (discount != null) discount.releaseUse();
+                if (discount != null) discounts.releaseUse(discount);
                 booking.markExpired();
                 releaseAuthorization(authorizationId, e);
                 throw e;
@@ -305,13 +304,13 @@ public final class BookingService {
                 } else {
                     long paid = booking.price().totalPaise();
                     payments.refund(booking.id() + "_unresolved", authorizationId, paid);
-                    booking.discountCode().ifPresent(DiscountCode::releaseUse);
+                    booking.discountCode().ifPresent(discounts::releaseUse);
                     booking.markPaymentRefunded(paid);
                 }
             }
             case RELEASED -> {
                 if (holdsSeats) inventory.cancel(booking.id(), booking.seatIds());
-                booking.discountCode().ifPresent(DiscountCode::releaseUse);
+                booking.discountCode().ifPresent(discounts::releaseUse);
                 booking.markPaymentFailed();
             }
             case AUTHORIZED -> throw new IllegalStateException("unreachable: authorized payments are handled above");
