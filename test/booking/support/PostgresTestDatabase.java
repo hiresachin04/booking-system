@@ -19,9 +19,9 @@ public final class PostgresTestDatabase implements AutoCloseable {
     private final String schema;
     private final PostgresDatabase database;
 
-    private PostgresTestDatabase(boolean migrate) {
+    private PostgresTestDatabase(boolean migrate, int poolSize, int lockPoolSize) {
         PostgresDatabase.Settings settings = PostgresDatabase.Settings.from(
-                StorageFactory.load(Path.of("config/application.properties")), System.getenv());
+                StorageFactory.load(Path.of("config/application.properties")), System.getenv()).withPoolSizes(poolSize, lockPoolSize);
         this.admin = new PostgresDatabase(settings);
         this.schema = "test_" + UUID.randomUUID().toString().replace("-", "");
         admin.withConnection(connection -> {
@@ -37,12 +37,17 @@ public final class PostgresTestDatabase implements AutoCloseable {
 
     /** Migrated to the latest schema. */
     public static PostgresTestDatabase create() {
-        return new PostgresTestDatabase(true);
+        return new PostgresTestDatabase(true, 10, 10);
     }
 
     /** An empty schema, for testing the migrator itself. */
     public static PostgresTestDatabase empty() {
-        return new PostgresTestDatabase(false);
+        return new PostgresTestDatabase(false, 10, 10);
+    }
+
+    /** An empty schema whose database pools have exactly these sizes. */
+    public static PostgresTestDatabase emptyWithPools(int poolSize, int lockPoolSize) {
+        return new PostgresTestDatabase(false, poolSize, lockPoolSize);
     }
 
     public PostgresDatabase database() {
@@ -53,13 +58,19 @@ public final class PostgresTestDatabase implements AutoCloseable {
         return schema;
     }
 
+    /** Closes the test's pools before dropping the schema, so no pooled connection outlives it. */
     @Override
     public void close() {
-        admin.withConnection(connection -> {
-            try (Statement statement = connection.createStatement()) {
-                statement.execute("DROP SCHEMA " + schema + " CASCADE");
-            }
-            return null;
-        });
+        try {
+            database.close();
+            admin.withConnection(connection -> {
+                try (Statement statement = connection.createStatement()) {
+                    statement.execute("DROP SCHEMA " + schema + " CASCADE");
+                }
+                return null;
+            });
+        } finally {
+            admin.close();
+        }
     }
 }

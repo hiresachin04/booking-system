@@ -49,21 +49,23 @@ class PostgresStorageFactoryTest {
 
     @Test
     void migratesTheSchemaAndReturnsWorkingPostgresStorage() {
-        Storage storage = StorageFactory.create(postgres(), Map.of(), clock);
-
-        assertInstanceOf(PostgresStorage.class, storage);
-        assertEquals(1, migrations());
-        storage.shows().add(Fixtures.show("sh", clock.instant().plus(Duration.ofHours(8))));
-        assertTrue(storage.shows().find("sh").isPresent());
+        try (Storage storage = StorageFactory.create(postgres(), Map.of(), clock)) {
+            assertInstanceOf(PostgresStorage.class, storage);
+            assertEquals(1, migrations());
+            storage.shows().add(Fixtures.show("sh", clock.instant().plus(Duration.ofHours(8))));
+            assertTrue(storage.shows().find("sh").isPresent());
+        }
     }
 
     @Test
     void startingAgainOnAMigratedDatabaseKeepsItsData() {
-        StorageFactory.create(postgres(), Map.of(), clock).shows().add(Fixtures.show("sh", clock.instant().plus(Duration.ofHours(8))));
+        try (Storage first = StorageFactory.create(postgres(), Map.of(), clock)) {
+            first.shows().add(Fixtures.show("sh", clock.instant().plus(Duration.ofHours(8))));
+        }
 
-        Storage restarted = StorageFactory.create(postgres(), Map.of(), clock);
-
-        assertEquals(1, migrations());
-        assertTrue(restarted.shows().find("sh").isPresent());
+        try (Storage restarted = StorageFactory.create(postgres(), Map.of(), clock)) {
+            assertEquals(1, migrations());
+            assertTrue(restarted.shows().find("sh").isPresent());
+        }
     }
 }

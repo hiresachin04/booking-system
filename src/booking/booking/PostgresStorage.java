@@ -59,6 +59,12 @@ public final class PostgresStorage implements Storage {
         return transactions;
     }
 
+    /** Closes the connection pools. */
+    @Override
+    public void close() {
+        database.close();
+    }
+
     @Override
     public PostgresNotificationOutbox outbox(List<BookingListener> listeners, RetryPolicy retry, Duration sentRetention, Clock outboxClock) {
         return new PostgresNotificationOutbox(database, bookings, listeners, retry, sentRetention, outboxClock);

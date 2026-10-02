@@ -45,6 +45,41 @@ class PostgresSettingsTest {
     }
 
     @Test
+    void readsBothPoolSizes() {
+        Properties properties = props("jdbc:postgresql://localhost/booking", "booking");
+        properties.setProperty("postgres.pool.size", " 25 ");
+        properties.setProperty("postgres.pool.lockSize", "4");
+
+        PostgresDatabase.Settings settings = PostgresDatabase.Settings.from(properties, Map.of());
+
+        assertEquals(25, settings.poolSize());
+        assertEquals(4, settings.lockPoolSize());
+    }
+
+    @Test
+    void defaultsBothPoolSizesWhenUnset() {
+        PostgresDatabase.Settings settings = PostgresDatabase.Settings.from(props("jdbc:postgresql://localhost/booking", "booking"), Map.of());
+
+        assertEquals(PostgresDatabase.DEFAULT_POOL_SIZE, settings.poolSize());
+        assertEquals(PostgresDatabase.DEFAULT_POOL_SIZE, settings.lockPoolSize());
+    }
+
+    @Test
+    void namesAPoolSizeThatIsNotANumber() {
+        Properties properties = props("jdbc:postgresql://localhost/booking", "booking");
+        properties.setProperty("postgres.pool.lockSize", "ten");
+
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> PostgresDatabase.Settings.from(properties, Map.of()));
+        assertEquals("postgres.pool.lockSize must be a whole number: ten", e.getMessage());
+    }
+
+    @Test
+    void rejectsAnEmptyPool() {
+        assertThrows(IllegalArgumentException.class, () -> new PostgresDatabase.Settings("jdbc:postgresql://localhost/booking", "u", "", 0, 1));
+        assertThrows(IllegalArgumentException.class, () -> new PostgresDatabase.Settings("jdbc:postgresql://localhost/booking", "u", "", 1, 0));
+    }
+
+    @Test
     void rejectsAUrlForAnotherDatabase() {
         assertThrows(IllegalArgumentException.class, () -> new PostgresDatabase.Settings("jdbc:mysql://localhost/booking", "u", ""));
     }

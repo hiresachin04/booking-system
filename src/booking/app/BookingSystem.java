@@ -70,7 +70,7 @@ public final class BookingSystem implements AutoCloseable {
         this.shutdownGrace = settings.shutdownGrace();
     }
 
-    /** {@code storage} usually comes from {@link StorageFactory#create}; BookingSystem doesn't choose it. */
+    /** {@code storage} usually comes from {@link StorageFactory#create}; BookingSystem doesn't choose it, but owns it from here and closes it. */
     public static BookingSystem start(Settings settings, Storage storage, PaymentGateway payments, List<BookingListener> listeners,
                                       Clock clock) {
         BookingSystem system = new BookingSystem(settings, storage, payments, listeners, clock);
@@ -102,16 +102,23 @@ public final class BookingSystem implements AutoCloseable {
         return jobs;
     }
 
-    /** Stops the jobs and waits up to {@code shutdownGrace} for a run in progress; interrupts it after that. */
+    /**
+     * Stops the jobs and waits up to {@code shutdownGrace} for a run in progress, interrupting it after that; then
+     * closes the storage, once nothing can still be using its connections.
+     */
     @Override
     public void close() {
-        jobs.close();
-        scheduler.shutdown();
         try {
-            if (!scheduler.awaitTermination(shutdownGrace.toNanos(), TimeUnit.NANOSECONDS)) scheduler.shutdownNow();
-        } catch (InterruptedException e) {
-            scheduler.shutdownNow();
-            Thread.currentThread().interrupt();
+            jobs.close();
+            scheduler.shutdown();
+            try {
+                if (!scheduler.awaitTermination(shutdownGrace.toNanos(), TimeUnit.NANOSECONDS)) scheduler.shutdownNow();
+            } catch (InterruptedException e) {
+                scheduler.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        } finally {
+            storage.close();
         }
     }
 

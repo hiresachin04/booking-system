@@ -5,8 +5,9 @@ cd "$(dirname "$0")"
 
 JUNIT=lib/junit-platform-console-standalone-6.1.3.jar
 # Main-code dependencies, each verified against Maven Central's SHA-1 when added: org.json for the Razorpay
-# adapter; the PostgreSQL JDBC driver and checker-qual, the only jar it needs at runtime.
-LIBS=lib/json-20260814.jar:lib/postgresql-42.7.13.jar:lib/checker-qual-3.55.1.jar
+# adapter; the PostgreSQL JDBC driver and checker-qual, the only jar it needs at runtime; HikariCP for connection
+# pooling, with slf4j-api and slf4j-jdk14 so its warnings reach java.util.logging instead of being discarded.
+LIBS=lib/json-20260814.jar:lib/postgresql-42.7.13.jar:lib/checker-qual-3.55.1.jar:lib/HikariCP-7.1.0.jar:lib/slf4j-api-2.0.17.jar:lib/slf4j-jdk14-2.0.17.jar
 BUILD=build
 
 # --live loads Razorpay test keys from secrets/razorpay.env so RazorpayLiveTest runs against Razorpay's test mode.
