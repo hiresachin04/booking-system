@@ -17,6 +17,24 @@
         <SOURCES />
       </library>
     </orderEntry>
+    <orderEntry type="module-library">
+      <library name="postgresql">
+        <CLASSES>
+          <root url="jar://$MODULE_DIR$/lib/postgresql-42.7.13.jar!/" />
+        </CLASSES>
+        <JAVADOC />
+        <SOURCES />
+      </library>
+    </orderEntry>
+    <orderEntry type="module-library">
+      <library name="checker-qual">
+        <CLASSES>
+          <root url="jar://$MODULE_DIR$/lib/checker-qual-3.55.1.jar!/" />
+        </CLASSES>
+        <JAVADOC />
+        <SOURCES />
+      </library>
+    </orderEntry>
     <orderEntry type="module-library" scope="TEST">
       <library name="junit">
         <CLASSES>
