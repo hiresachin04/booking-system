@@ -17,6 +17,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -59,6 +60,8 @@ public final class FakePaymentGateway implements PaymentGateway {
     private final List<Refund> refunds = new ArrayList<>();
     private final Set<String> refundKeys = new HashSet<>();
     private int verifyAttempts;
+    private int paidLookups;
+    private int unreachablePaidLookups;
     private RuntimeException failNextStartPayment;
     private int captureAttempts;
     private int unavailableCaptures;
@@ -95,6 +98,11 @@ public final class FakePaymentGateway implements PaymentGateway {
     /** The next {@link #simulateCheckout} ends in a failed payment, as when the bank declines the card. */
     public synchronized void declineNext(String reason) {
         declineNextWith = reason;
+    }
+
+    /** The next {@code times} findPaidAuthorization calls fail as if the processor were unreachable. */
+    public synchronized void failPaidLookups(int times) {
+        unreachablePaidLookups = times;
     }
 
     public synchronized void failNextStartPayment(RuntimeException failure) {
@@ -178,6 +186,24 @@ public final class FakePaymentGateway implements PaymentGateway {
             authorizedPaymentByOrder.put(session.orderId(), paymentId);
         }
         return new CheckoutResult(session.orderId(), paymentId, RazorpaySignature.sign(KEY_SECRET, session.orderId(), paymentId));
+    }
+
+    @Override
+    public synchronized Optional<String> findPaidAuthorization(CheckoutSession session) {
+        paidLookups++;
+        if (unreachablePaidLookups > 0) {
+            unreachablePaidLookups--;
+            throw new RuntimeException("processor unreachable");
+        }
+        String paymentId = authorizedPaymentByOrder.get(session.orderId());
+        if (paymentId == null || requireKnown(paymentId) == PaymentStatus.RELEASED) return Optional.empty();
+        if (authorizations.get(paymentId).amountPaise() != session.amountPaise()) return Optional.empty();
+        return Optional.of(paymentId);
+    }
+
+    /** Every findPaidAuthorization call, including ones made to fail. */
+    public synchronized int paidLookups() {
+        return paidLookups;
     }
 
     @Override

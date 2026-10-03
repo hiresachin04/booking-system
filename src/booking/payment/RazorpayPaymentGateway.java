@@ -1,5 +1,6 @@
 package booking.payment;
 
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
@@ -13,6 +14,7 @@ import java.time.Duration;
 import java.util.Base64;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * {@link PaymentGateway} over Razorpay's REST API (v1), with orders created for manual capture.
@@ -123,6 +125,25 @@ public final class RazorpayPaymentGateway implements PaymentGateway {
             case "created" -> new PaymentResult.Declined("payment not completed");
             default -> throw new IllegalStateException("unknown Razorpay payment status " + payment.getString("status"));
         };
+    }
+
+    @Override
+    public Optional<String> findPaidAuthorization(CheckoutSession session) {
+        JSONArray payments = send(get("orders/" + session.orderId() + "/payments")).getJSONArray("items");
+        String earliest = null;
+        long earliestCreated = Long.MAX_VALUE;
+        for (int i = 0; i < payments.length(); i++) {
+            JSONObject payment = payments.getJSONObject(i);
+            String status = payment.getString("status");
+            boolean paid = status.equals("authorized") || status.equals("captured");
+            boolean ours = session.orderId().equals(payment.optString("order_id")) && payment.getLong("amount") == session.amountPaise()
+                    && session.currency().equals(payment.getString("currency"));
+            if (paid && ours && payment.getLong("created_at") < earliestCreated) {
+                earliest = payment.getString("id");
+                earliestCreated = payment.getLong("created_at");
+            }
+        }
+        return Optional.ofNullable(earliest);
     }
 
     @Override

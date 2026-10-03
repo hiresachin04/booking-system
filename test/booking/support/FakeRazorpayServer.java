@@ -5,6 +5,7 @@ import booking.payment.CheckoutSession;
 import booking.payment.RazorpaySignature;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.IOException;
@@ -63,7 +64,7 @@ public final class FakeRazorpayServer implements AutoCloseable {
         JSONObject toJson() {
             JSONObject json = new JSONObject().put("id", id).put("entity", "payment").put("amount", amount)
                     .put("currency", currency).put("status", status).put("order_id", orderId).put("captured", captured)
-                    .put("amount_refunded", amountRefunded);
+                    .put("amount_refunded", amountRefunded).put("created_at", authorizedAt.getEpochSecond());
             if (errorDescription != null) json.put("error_code", "BAD_REQUEST_ERROR").put("error_description", errorDescription);
             return json;
         }
@@ -210,6 +211,7 @@ public final class FakeRazorpayServer implements AutoCloseable {
         }
         String[] parts = path.substring("/v1/".length()).split("/");
         if (method.equals("POST") && parts.length == 1 && parts[0].equals("orders")) return createOrder(new JSONObject(body));
+        if (method.equals("GET") && parts.length == 3 && parts[0].equals("orders") && parts[2].equals("payments")) return orderPayments(parts[1]);
         if (parts.length >= 2 && parts[0].equals("payments")) {
             Payment payment = current(payments.get(parts[1]));
             if (payment == null) return error(400, "BAD_REQUEST_ERROR", "The id provided does not exist");
@@ -229,6 +231,15 @@ public final class FakeRazorpayServer implements AutoCloseable {
         JSONObject order = new JSONObject(request.toString()).put("id", id).put("entity", "order").put("status", "created");
         orders.put(id, order);
         return new Response(200, order);
+    }
+
+    private Response orderPayments(String orderId) {
+        if (!orders.containsKey(orderId)) return error(400, "BAD_REQUEST_ERROR", "The id provided does not exist");
+        JSONArray items = new JSONArray();
+        for (Payment payment : payments.values()) {
+            if (payment.orderId.equals(orderId)) items.put(current(payment).toJson());
+        }
+        return new Response(200, new JSONObject().put("entity", "collection").put("count", items.length()).put("items", items));
     }
 
     private Response capture(Payment payment, JSONObject request) {

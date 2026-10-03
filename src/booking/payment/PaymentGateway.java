@@ -1,5 +1,7 @@
 package booking.payment;
 
+import java.util.Optional;
+
 /**
  * Two-phase payment: funds are reserved first and only taken once the seats are secured, so losing the seats
  * during payment never leaves the customer charged. Idempotency keys are at least 10 characters of letters, digits,
@@ -19,6 +21,13 @@ public interface PaymentGateway {
      * result is forged or belongs to another order or amount. Verifying the same result twice gives the same answer.
      */
     PaymentResult verifyCheckout(CheckoutSession session, CheckoutResult result);
+
+    /**
+     * Asks the processor whether this order has been paid, without the browser's result: for when the customer paid
+     * but the browser never reported it (tab closed, phone slept). Returns the authorization id of a payment for this
+     * exact order and amount that is authorized or captured, the earliest if there are several; empty if none.
+     */
+    Optional<String> findPaidAuthorization(CheckoutSession session);
 
     /**
      * Takes the reserved funds. Capturing the same authorization twice must not charge twice; the second call may

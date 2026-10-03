@@ -15,6 +15,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -183,6 +184,58 @@ class PaymentGatewayContractTest {
         PaymentResult result = gateway.verifyCheckout(session, h.pay(session));
 
         assertEquals(new PaymentResult.Declined("insufficient funds"), result);
+    }
+
+    @ParameterizedTest
+    @MethodSource("profiles")
+    void findsNoPaidAuthorizationBeforeTheCustomerPays(HarnessFactory profile) throws Exception {
+        Harness h = open(profile);
+        CheckoutSession session = h.gateway().startPayment("booking-0001", "u1", 20_000);
+
+        assertEquals(Optional.empty(), h.gateway().findPaidAuthorization(session));
+    }
+
+    @ParameterizedTest
+    @MethodSource("profiles")
+    void findsThePaymentTheBrowserNeverReported(HarnessFactory profile) throws Exception {
+        Harness h = open(profile);
+        CheckoutSession session = h.gateway().startPayment("booking-0001", "u1", 20_000);
+        String paid = approved(h.gateway().verifyCheckout(session, h.pay(session)));
+
+        assertEquals(Optional.of(paid), h.gateway().findPaidAuthorization(session));
+    }
+
+    @ParameterizedTest
+    @MethodSource("profiles")
+    void ignoresAFailedPayment(HarnessFactory profile) throws Exception {
+        Harness h = open(profile);
+        CheckoutSession session = h.gateway().startPayment("booking-0001", "u1", 20_000);
+        h.declineNextPayment("insufficient funds");
+        h.pay(session);
+
+        assertEquals(Optional.empty(), h.gateway().findPaidAuthorization(session));
+    }
+
+    @ParameterizedTest
+    @MethodSource("profiles")
+    void ignoresAPaymentForADifferentAmount(HarnessFactory profile) throws Exception {
+        Harness h = open(profile);
+        CheckoutSession session = h.gateway().startPayment("booking-0001", "u1", 20_000);
+        h.pay(session);
+        CheckoutSession pricier = new CheckoutSession(session.orderId(), 55_000, session.currency(), session.publicKeyId());
+
+        assertEquals(Optional.empty(), h.gateway().findPaidAuthorization(pricier));
+    }
+
+    @ParameterizedTest
+    @MethodSource("profiles")
+    void ignoresAnAuthorizationThatExpiredUnused(HarnessFactory profile) throws Exception {
+        Harness h = open(profile);
+        CheckoutSession session = h.gateway().startPayment("booking-0001", "u1", 20_000);
+        h.pay(session);
+        clock.advance(h.authorizationExpiry());
+
+        assertEquals(Optional.empty(), h.gateway().findPaidAuthorization(session));
     }
 
     @ParameterizedTest
