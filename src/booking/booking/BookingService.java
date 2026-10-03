@@ -411,6 +411,11 @@ public final class BookingService {
         });
     }
 
+    /** The user's booking as stored now; someone else's reads as missing, like every other call here. */
+    public Booking find(User user, String bookingId) {
+        return ownedBy(user, bookingId);
+    }
+
     // Someone else's booking reads as missing rather than forbidden, so booking ids can't be probed.
     private Booking ownedBy(User user, String bookingId) {
         return bookings.find(bookingId)

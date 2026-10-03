@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Book seats</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  h1 { margin-bottom: .2rem; }
+  .muted { color: #666; }
+  #seats { display: grid; grid-template-columns: repeat(10, 2.6rem); gap: .35rem; margin: 1.2rem 0; }
+  .seat { height: 2.2rem; border: 1px solid #999; border-radius: .3rem; background: #fff; cursor: pointer; font-size: .8rem; }
+  .seat.PREMIUM { border-color: #b8860b; }
+  .seat.selected { background: #2b6cb0; color: #fff; }
+  .seat:disabled { background: #ddd; color: #888; cursor: not-allowed; }
+  .row { display: flex; gap: .6rem; align-items: center; margin: .6rem 0; }
+  button.primary { padding: .55rem 1.1rem; font-size: 1rem; }
+  #status { margin-top: 1rem; padding: .8rem; border-radius: .3rem; background: #f4f4f4; white-space: pre-line; }
+  #status.error { background: #fde8e8; }
+  #status.ok { background: #e6f6ea; }
+  table { border-collapse: collapse; margin-top: .5rem; }
+  td { padding: .15rem .8rem .15rem 0; }
+</style>
+</head>
+<body>
+<h1 id="title">Loading…</h1>
+<div id="subtitle" class="muted"></div>
+<div class="muted">You are <b id="user"></b> (demo: not a real login).</div>
+
+<div id="seats"></div>
+<div class="muted">Gold border: premium. Grey: held or booked.</div>
+
+<div class="row">
+  <label>Discount code <input id="code" placeholder="optional"></label>
+  <button class="primary" id="pay" disabled>Hold &amp; pay</button>
+</div>
+
+<div id="status">Pick seats to start.</div>
+<table id="breakdown"></table>
+<div class="row"><button id="cancel" hidden>Cancel booking</button></div>
+
+<script>
+"use strict";
+const showId = new URLSearchParams(location.search).get("show");
+const userId = localStorage.getItem("demoUser") || ("user-" + Math.random().toString(36).slice(2, 10));
+localStorage.setItem("demoUser", userId);
+document.getElementById("user").textContent = userId;
+
+const selected = new Set();
+let booking = null;
+
+function rupees(paise) { return "₹" + (paise / 100).toFixed(2); }
+
+function say(text, kind) {
+  const el = document.getElementById("status");
+  el.textContent = text;
+  el.className = kind || "";
+}
+
+async function api(method, path, body) {
+  const response = await fetch(path, {
+    method,
+    headers: { "Content-Type": "application/json", "X-User-Id": userId },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const data = await response.json();
+  return { status: response.status, data };
+}
+
+async function loadShow() {
+  if (!showId) { say("Open this page with ?show=<show id> (run.sh prints the link).", "error"); return; }
+  const { status, data } = await api("GET", "/api/shows/" + encodeURIComponent(showId));
+  if (status !== 200) { say(data.message, "error"); return; }
+  document.getElementById("title").textContent = data.movie.title;
+  document.getElementById("subtitle").textContent = data.theater.name + ", " + data.theater.city + " · "
+      + new Date(data.startsAt).toLocaleString(undefined, { timeZone: data.theater.zone, dateStyle: "medium", timeStyle: "short" });
+  const grid = document.getElementById("seats");
+  grid.replaceChildren();
+  for (const seat of data.seats) {
+    const button = document.createElement("button");
+    button.className = "seat " + seat.tier + (selected.has(seat.id) ? " selected" : "");
+    button.textContent = seat.id;
+    button.title = seat.tier + " " + rupees(seat.pricePaise);
+    button.disabled = seat.status !== "AVAILABLE";
+    button.onclick = () => {
+      if (selected.has(seat.id)) selected.delete(seat.id); else selected.add(seat.id);
+      button.classList.toggle("selected");
+      document.getElementById("pay").disabled = selected.size === 0 || booking !== null;
+    };
+    grid.appendChild(button);
+  }
+}
+
+function showBreakdown(b) {
+  const table = document.getElementById("breakdown");
+  table.replaceChildren();
+  for (const line of b.price.lines.concat([{ label: "Total", amountPaise: b.price.totalPaise }])) {
+    const row = table.insertRow();
+    row.insertCell().textContent = line.label;
+    row.insertCell().textContent = rupees(line.amountPaise);
+  }
+}
+
+async function finished(b) {
+  booking = b;
+  document.getElementById("cancel").hidden = b.status !== "CONFIRMED";
+  const messages = {
+    CONFIRMED: ["Booked: " + b.seatIds.join(", ") + ". A confirmation is on its way.", "ok"],
+    CANCELLED: ["Cancelled. Refund: " + rupees(b.refundedPaise) + ".", "ok"],
+    PAYMENT_FAILED: ["The payment didn't go through; any amount held will be returned.", "error"],
+    PAYMENT_REFUNDED: ["We couldn't keep your seats, so the payment was refunded in full.", "error"],
+    EXPIRED: ["Your hold ran out before the payment finished; any amount held will be returned.", "error"],
+    RELEASED: ["Seats released.", ""],
+  };
+  const [text, kind] = messages[b.status] || ["Status: " + b.status, ""];
+  say(text, kind);
+  if (b.status !== "CONFIRMED") { booking = null; selected.clear(); }
+  await loadShow();
+}
+
+// A 202 means the payment outcome is still being settled in the background; the booking says when it's done.
+async function waitForSettlement(id) {
+  for (let i = 0; i < 60; i++) {
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    const { status, data } = await api("GET", "/api/bookings/" + id);
+    if (status === 200 && data.status !== "PAYMENT_PENDING" && data.status !== "PAYMENT_UNRESOLVED") return finished(data);
+  }
+  say("Still confirming your payment. Check back shortly; nothing more is needed from you.", "");
+}
+
+document.getElementById("pay").onclick = async () => {
+  document.getElementById("pay").disabled = true;
+  const code = document.getElementById("code").value.trim();
+  const { status, data } = await api("POST", "/api/bookings", { showId, seatIds: [...selected], discountCode: code || null });
+  if (status !== 201) { say(data.message, "error"); document.getElementById("pay").disabled = false; await loadShow(); return; }
+  booking = data;
+  showBreakdown(data);
+  say("Seats held until " + new Date(data.holdExpiresAt).toLocaleTimeString() + ". Complete the payment in the Razorpay window.");
+  new Razorpay({
+    key: data.checkout.keyId,
+    order_id: data.checkout.orderId,
+    amount: data.checkout.amountPaise,
+    currency: data.checkout.currency,
+    name: document.getElementById("title").textContent,
+    description: "Seats " + data.seatIds.join(", "),
+    handler: async result => {
+      say("Confirming your payment…");
+      const confirmed = await api("POST", "/api/bookings/" + data.id + "/confirm", result);
+      if (confirmed.status === 200) return finished(confirmed.data);
+      if (confirmed.status === 202) { say("Payment received, confirming with the bank…"); return waitForSettlement(data.id); }
+      say(confirmed.data.message, "error");
+      booking = null;
+      await loadShow();
+    },
+    modal: {
+      ondismiss: async () => {
+        const released = await api("POST", "/api/bookings/" + data.id + "/release");
+        if (released.status === 200) await finished(released.data);
+      },
+    },
+  }).open();
+};
+
+document.getElementById("cancel").onclick = async () => {
+  if (!booking || !confirm("Cancel this booking?")) return;
+  const { status, data } = await api("POST", "/api/bookings/" + booking.id + "/cancel");
+  if (status === 200) await finished(data); else say(data.message, "error");
+};
+
+loadShow();
+</script>
+</body>
+</html>

@@ -3,11 +3,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+source scripts/common.sh
 JUNIT=lib/junit-platform-console-standalone-6.1.3.jar
-# Main-code dependencies, each verified against Maven Central's SHA-1 when added: org.json for the Razorpay
-# adapter; the PostgreSQL JDBC driver and checker-qual, the only jar it needs at runtime; HikariCP for connection
-# pooling, with slf4j-api and slf4j-jdk14 so its warnings reach java.util.logging instead of being discarded.
-LIBS=lib/json-20260814.jar:lib/postgresql-42.7.13.jar:lib/checker-qual-3.55.1.jar:lib/HikariCP-7.1.0.jar:lib/slf4j-api-2.0.17.jar:lib/slf4j-jdk14-2.0.17.jar
 BUILD=build
 
 # --live loads Razorpay test keys from secrets/razorpay.env so RazorpayLiveTest runs against Razorpay's test mode.
@@ -19,15 +16,14 @@ for arg in "$@"; do
     # throwaway schema. Opt-in, because it needs a running server.
     export POSTGRES_TESTS=1
   elif [[ "$arg" == --live ]]; then
-    if [[ ! -f secrets/razorpay.env ]]; then echo "--live needs secrets/razorpay.env (see CLAUDE.md)" >&2; exit 1; fi
-    set -a; source secrets/razorpay.env; set +a
-    if [[ "${RAZORPAY_KEY_ID:-}" != rzp_test_* ]]; then echo "refusing --live: RAZORPAY_KEY_ID is not a test key" >&2; exit 1; fi
+    load_razorpay_test_keys --live
   else
     ARGS+=("$arg")
   fi
 done
 
-rm -rf "$BUILD"
+# Only the test build is cleared: run.sh builds into $BUILD/run, which a running server is still loading classes from.
+rm -rf "$BUILD/main" "$BUILD/test"
 mkdir -p "$BUILD/main" "$BUILD/test"
 # javac fails when given no files, so an empty src/ or test/ is skipped rather than treated as an error.
 MAIN_SOURCES=$(find src -name '*.java')
