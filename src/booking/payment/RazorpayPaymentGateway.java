@@ -44,11 +44,14 @@ public final class RazorpayPaymentGateway implements PaymentGateway {
         }
 
         /**
-         * Reads {@code RAZORPAY_KEY_ID} and {@code RAZORPAY_KEY_SECRET}. The 20-minute expiry outlasts the default
-         * 15-minute pending window, so capture retries finish before Razorpay gives the money back.
+         * Reads {@code RAZORPAY_KEY_ID} and {@code RAZORPAY_KEY_SECRET}, and optionally {@code RAZORPAY_API_URL} (default:
+         * Razorpay's API; tests point it at a local fake). The 20-minute expiry outlasts the default 15-minute pending
+         * window, so capture retries finish before Razorpay gives the money back.
          */
         public static Config fromEnvironment(Map<String, String> env) {
-            return new Config(LIVE_API, require(env, "RAZORPAY_KEY_ID"), require(env, "RAZORPAY_KEY_SECRET"), "INR",
+            String api = env.get("RAZORPAY_API_URL");
+            URI baseUrl = api == null || api.isBlank() ? LIVE_API : URI.create(api.strip());
+            return new Config(baseUrl, require(env, "RAZORPAY_KEY_ID"), require(env, "RAZORPAY_KEY_SECRET"), "INR",
                     Duration.ofMinutes(20), Duration.ofSeconds(10));
         }
 
