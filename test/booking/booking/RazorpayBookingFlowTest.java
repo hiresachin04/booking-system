@@ -89,6 +89,21 @@ class RazorpayBookingFlowTest {
     }
 
     @Test
+    void aPaymentMadeAfterTheHoldRanOutIsLeftForRazorpayToRefundAndNotLookedUpAgain() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        razorpay.simulateCheckout(booking.checkout());
+        clock.advance(TTL);
+
+        service.reconcilePendingPayments();
+        service.reconcilePendingPayments();
+
+        assertEquals(BookingStatus.EXPIRED, storage.bookings().find(booking.id()).orElseThrow().status());
+        assertEquals(PaymentStatus.AUTHORIZED, razorpay.state("auth_1"));
+        assertEquals(1, razorpay.paidLookups());
+        assertEquals(List.of("payment failed"), deliveredEvents());
+    }
+
+    @Test
     void unknownCaptureIsRetriedIntoAConfirmedBooking() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
         razorpay.failCaptures(1);

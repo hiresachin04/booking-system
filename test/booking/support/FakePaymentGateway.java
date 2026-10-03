@@ -206,6 +206,16 @@ public final class FakePaymentGateway implements PaymentGateway {
         return paidLookups;
     }
 
+    /** A second, separate authorized payment for an order that already has one, as when a customer pays twice. */
+    public synchronized CheckoutResult simulateAnotherPayment(CheckoutSession session) {
+        Order order = orders.get(session.orderId());
+        if (order == null) throw new IllegalArgumentException("unknown order " + session.orderId());
+        String paymentId = "auth_" + (authorizations.size() + 1);
+        authorizations.put(paymentId, new Authorization(session.orderId(), order.userId(), order.amountPaise(), clock.instant()));
+        states.put(paymentId, PaymentStatus.AUTHORIZED);
+        return new CheckoutResult(session.orderId(), paymentId, RazorpaySignature.sign(KEY_SECRET, session.orderId(), paymentId));
+    }
+
     @Override
     public synchronized PaymentResult verifyCheckout(CheckoutSession session, CheckoutResult result) {
         verifyAttempts++;

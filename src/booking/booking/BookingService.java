@@ -26,10 +26,14 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.function.BiFunction;
 
 public final class BookingService {
+    /** How long a hold is left to the browser's own confirm before reconciliation asks the processor about it. */
+    public static final Duration BROWSER_CONFIRM_GRACE = Duration.ofSeconds(60);
+
     private final ShowStore shows;
     private final BookingStore bookings;
     private final DiscountStore discounts;
@@ -106,75 +110,101 @@ public final class BookingService {
         Objects.requireNonNull(checkoutResult, "checkoutResult");
         ownedBy(user, bookingId);
         return underLock(bookingId, (booking, events) -> {
-            SeatInventory inventory = inventoryOf(booking.show().id());
+            // Reconciliation may have got here first, from the processor, while the browser was still on its way.
+            if (booking.status() == BookingStatus.CONFIRMED) return alreadyConfirmed(booking, checkoutResult);
+            if (booking.status() == BookingStatus.EXPIRED) {
+                HoldExpiredException expired = new HoldExpiredException(booking.id());
+                releasePaidAuthorization(booking, checkoutResult, expired);
+                throw expired;
+            }
             booking.requireCanTransitionTo(BookingStatus.CONFIRMED);
             Instant now = clock.instant();
             requireNotStarted(booking.show(), now);
+            SeatInventory inventory = inventoryOf(booking.show().id());
             if (!now.isBefore(booking.holdExpiresAt())) {
-                inventory.release(booking.id(), booking.seatIds());
-                booking.markExpired();
+                expireHold(booking, inventory);
                 HoldExpiredException expired = new HoldExpiredException(booking.id());
                 // The customer paid in the browser after the hold ran out: that authorization must never be captured.
                 releasePaidAuthorization(booking, checkoutResult, expired);
                 throw expired;
             }
-
-            String discount = booking.discountCode().orElse(null);
-            if (discount != null && !discounts.tryConsume(discount, now)) {
-                throw new DiscountRejectedException(discount, "no longer valid or usage limit reached");
-            }
-            String authorizationId;
-            try {
-                authorizationId = verifyPayment(booking, checkoutResult);
-            } catch (RuntimeException e) {
-                if (discount != null) discounts.releaseUse(discount);
-                throw e;
-            }
-
-            // Checkpoint before anything irreversible: saved as PAYMENT_PENDING with capture due now, a crash at any point
-            // from here leaves a booking reconciliation finishes (book the seats, then capture; or release them),
-            // never a HELD booking whose seats are BOOKED or whose payment was taken.
-            booking.markPaymentPending(authorizationId, clock.instant());
-            bookings.update(booking);
-
-            // Verification ran outside the show lock, so the hold may have lapsed and the seats gone to someone else.
-            // Only funds were reserved, so losing the seats costs the customer nothing.
-            try {
-                inventory.confirm(booking.id(), booking.seatIds());
-            } catch (HoldExpiredException e) {
-                if (discount != null) discounts.releaseUse(discount);
-                booking.markExpired();
-                releaseAuthorization(authorizationId, e);
-                throw e;
-            }
-
-            // Seats are secured; take the money. A failed capture call doesn't prove the money wasn't taken (the
-            // response may have timed out after the processor captured), so the seats stay ours until it says so.
-            try {
-                payments.capture(authorizationId, booking.price().totalPaise());
-            } catch (RuntimeException captureFailure) {
-                Instant failedAt = clock.instant();
-                booking.recordFailedCapture(failedAt, captureFailure instanceof PaymentRejectedException, config.captureRetry());
-                try {
-                    advancePayment(booking, inventory);
-                } catch (RuntimeException settleFailure) {
-                    captureFailure.addSuppressed(settleFailure);
-                }
-                releaseSeatsIfStuck(booking, inventory);
-                switch (booking.status()) {
-                    case CONFIRMED -> {
-                        // The processor had captured after all.
-                    }
-                    case PAYMENT_PENDING -> throw new PaymentPendingException(booking.id(), captureFailure);
-                    // PAYMENT_FAILED or PAYMENT_UNRESOLVED: the seats are no longer this customer's.
-                    default -> throw captureFailure;
-                }
-            }
-            if (booking.status() != BookingStatus.CONFIRMED) booking.markConfirmed(authorizationId);
-            // Saved in the same transaction as the state change; delivery happens later and can't fail this call.
-            events.add(BookingEventType.CONFIRMED);
+            completePaidConfirmation(booking, verifyPayment(booking, checkoutResult), inventory, events);
             return booking;
         });
+    }
+
+    /** A repeated confirm for the payment that confirmed this booking is answered with the booking, not an error. */
+    private Booking alreadyConfirmed(Booking booking, CheckoutResult checkoutResult) {
+        String authorizationId = verifyPayment(booking, checkoutResult);
+        if (booking.paymentId().equals(Optional.of(authorizationId))) return booking;
+        // A second, different payment for an already-confirmed booking: never capture it.
+        IllegalBookingStateException duplicate = new IllegalBookingStateException(booking.id(), booking.status(), BookingStatus.CONFIRMED);
+        releaseAuthorization(authorizationId, duplicate);
+        throw duplicate;
+    }
+
+    /**
+     * Everything after a payment is known to be real, shared by the browser's confirm and by reconciliation finding a
+     * payment the browser never reported, so the two can't drift apart. Throws, with the booking left in whatever
+     * state it reached, if the discount ran out, the seats were lost, or the capture didn't go through.
+     */
+    private void completePaidConfirmation(Booking booking, String authorizationId, SeatInventory inventory, List<BookingEventType> events) {
+        // The use is taken only now the payment is real. If the code ran out meanwhile, the customer paid a price we
+        // can no longer honour, so the payment is released, never captured.
+        String discount = booking.discountCode().orElse(null);
+        if (discount != null && !discounts.tryConsume(discount, clock.instant())) {
+            DiscountRejectedException rejected = new DiscountRejectedException(discount, "no longer valid or usage limit reached");
+            releaseAuthorization(authorizationId, rejected);
+            throw rejected;
+        }
+
+        // Checkpoint before anything irreversible: saved as PAYMENT_PENDING with capture due now, a crash at any point
+        // from here leaves a booking reconciliation finishes (book the seats, then capture; or release them),
+        // never a HELD booking whose seats are BOOKED or whose payment was taken.
+        booking.markPaymentPending(authorizationId, clock.instant());
+        bookings.update(booking);
+
+        // Verification ran outside the show lock, so the hold may have lapsed and the seats gone to someone else.
+        // Only funds were reserved, so losing the seats costs the customer nothing.
+        try {
+            inventory.confirm(booking.id(), booking.seatIds());
+        } catch (HoldExpiredException e) {
+            if (discount != null) discounts.releaseUse(discount);
+            booking.markExpired();
+            releaseAuthorization(authorizationId, e);
+            throw e;
+        }
+
+        // Seats are secured; take the money. A failed capture call doesn't prove the money wasn't taken (the
+        // response may have timed out after the processor captured), so the seats stay ours until it says so.
+        try {
+            payments.capture(authorizationId, booking.price().totalPaise());
+        } catch (RuntimeException captureFailure) {
+            Instant failedAt = clock.instant();
+            booking.recordFailedCapture(failedAt, captureFailure instanceof PaymentRejectedException, config.captureRetry());
+            try {
+                advancePayment(booking, inventory);
+            } catch (RuntimeException settleFailure) {
+                captureFailure.addSuppressed(settleFailure);
+            }
+            releaseSeatsIfStuck(booking, inventory);
+            switch (booking.status()) {
+                case CONFIRMED -> {
+                    // The processor had captured after all.
+                }
+                case PAYMENT_PENDING -> throw new PaymentPendingException(booking.id(), captureFailure);
+                // PAYMENT_FAILED or PAYMENT_UNRESOLVED: the seats are no longer this customer's.
+                default -> throw captureFailure;
+            }
+        }
+        if (booking.status() != BookingStatus.CONFIRMED) booking.markConfirmed(authorizationId);
+        // Saved in the same transaction as the state change; delivery happens later and can't fail this call.
+        events.add(BookingEventType.CONFIRMED);
+    }
+
+    private static void expireHold(Booking booking, SeatInventory inventory) {
+        inventory.release(booking.id(), booking.seatIds());
+        booking.markExpired();
     }
 
     public Booking release(User user, String bookingId) {
@@ -268,7 +298,74 @@ public final class BookingService {
                 return null;
             });
         }
-        return new ReconciliationReport(settled, seatsReleased, awaitingExpiry, failures);
+        List<String> confirmedWithoutBrowser = new ArrayList<>();
+        List<String> expiredHolds = new ArrayList<>();
+        for (Booking listed : bookings.findByStatus(BookingStatus.HELD)) {
+            if (!dueForPaymentLookup(listed, clock.instant())) continue;
+            underLock(listed.id(), (booking, events) -> {
+                if (booking.status() != BookingStatus.HELD) return null;
+                try {
+                    switch (settleUnreportedPayment(booking, events)) {
+                        case CONFIRMED -> confirmedWithoutBrowser.add(booking.id());
+                        case EXPIRED -> expiredHolds.add(booking.id());
+                        case STILL_HELD, PENDING -> {
+                            // Nothing to report: still waiting for the customer, or now settled by the pending path.
+                        }
+                    }
+                } catch (RuntimeException e) {
+                    failures.add(new ReconciliationReport.Failure(booking.id(), e));
+                }
+                return null;
+            });
+        }
+        return new ReconciliationReport(settled, seatsReleased, awaitingExpiry, confirmedWithoutBrowser, expiredHolds, failures);
+    }
+
+    private enum HeldOutcome { STILL_HELD, CONFIRMED, PENDING, EXPIRED }
+
+    private boolean dueForPaymentLookup(Booking booking, Instant now) {
+        Instant heldSince = booking.holdExpiresAt().minus(config.holdTtl());
+        return !now.isBefore(heldSince.plus(BROWSER_CONFIRM_GRACE)) || !now.isBefore(booking.holdExpiresAt());
+    }
+
+    /**
+     * For a hold the browser never confirmed: asks the processor whether the customer paid anyway (tab closed, phone
+     * slept) and finishes the booking server-side if so. A hold that ran out ends as EXPIRED, paid or not, so it
+     * isn't looked up again. The customer is no longer on the page, so a payment that can't be honoured is
+     * reported with a PAYMENT_FAILED event.
+     */
+    private HeldOutcome settleUnreportedPayment(Booking booking, List<BookingEventType> events) {
+        SeatInventory inventory = inventoryOf(booking.show().id());
+        Optional<String> paid = payments.findPaidAuthorization(booking.checkout());
+        Instant now = clock.instant();
+        boolean holdLive = now.isBefore(booking.holdExpiresAt()) && now.isBefore(booking.show().startsAt());
+        if (paid.isEmpty()) {
+            if (holdLive) return HeldOutcome.STILL_HELD;
+            expireHold(booking, inventory);
+            return HeldOutcome.EXPIRED;
+        }
+        if (!holdLive) {
+            // Void before expiring, so a failed void leaves the booking HELD and is retried on the next run.
+            payments.tryVoid(paid.get());
+            expireHold(booking, inventory);
+            events.add(BookingEventType.PAYMENT_FAILED);
+            return HeldOutcome.EXPIRED;
+        }
+        try {
+            completePaidConfirmation(booking, paid.get(), inventory, events);
+            return HeldOutcome.CONFIRMED;
+        } catch (PaymentPendingException stillSettling) {
+            return HeldOutcome.PENDING;
+        } catch (DiscountRejectedException rejected) {
+            // Left HELD, the still-authorized payment would be found, and refused, again on every run.
+            expireHold(booking, inventory);
+            events.add(BookingEventType.PAYMENT_FAILED);
+            return HeldOutcome.EXPIRED;
+        } catch (HoldExpiredException seatsLost) {
+            // completePaidConfirmation already expired the booking and released the payment.
+            events.add(BookingEventType.PAYMENT_FAILED);
+            return HeldOutcome.EXPIRED;
+        }
     }
 
     private enum Progress { SETTLED, WAITING, AWAITING_PROCESSOR_EXPIRY }

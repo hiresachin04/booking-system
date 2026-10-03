@@ -573,6 +573,148 @@ abstract class BookingServiceContract {
         assertEquals(1, payments.refunds().size());
     }
 
+    // --- payments the browser never reported (tab closed, phone slept) ---
+
+    /** The customer pays in Checkout, but the page never gets to call confirm. */
+    private CheckoutResult payAndCloseTheTab(Booking booking) {
+        return payments.simulateCheckout(booking.checkout());
+    }
+
+    @Test
+    void aPaymentTheBrowserNeverReportedIsConfirmedByReconciliation() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        payAndCloseTheTab(booking);
+        clock.advance(BookingService.BROWSER_CONFIRM_GRACE);
+
+        ReconciliationReport report = service.reconcilePendingPayments();
+
+        assertEquals(List.of(booking.id()), report.confirmedWithoutBrowserBookingIds());
+        assertEquals(BookingStatus.CONFIRMED, latest(booking).status());
+        assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
+        assertEquals(1, payments.captures().size());
+        assertEquals(List.of("confirmed " + booking.id()), deliveredEvents());
+    }
+
+    @Test
+    void leavesTheBrowserItsGracePeriodBeforeAskingTheProcessor() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        payAndCloseTheTab(booking);
+        clock.advance(BookingService.BROWSER_CONFIRM_GRACE.minusNanos(1));
+
+        service.reconcilePendingPayments();
+        assertEquals(0, payments.paidLookups());
+        assertEquals(BookingStatus.HELD, latest(booking).status());
+
+        clock.advance(Duration.ofNanos(1));
+        service.reconcilePendingPayments();
+        assertEquals(1, payments.paidLookups());
+        assertEquals(BookingStatus.CONFIRMED, latest(booking).status());
+    }
+
+    @Test
+    void aPaymentMadeAfterTheHoldRanOutIsReleasedAndTheCustomerTold() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        payAndCloseTheTab(booking);
+        clock.advance(TTL);
+
+        ReconciliationReport report = service.reconcilePendingPayments();
+
+        assertEquals(List.of(booking.id()), report.expiredHoldBookingIds());
+        assertEquals(BookingStatus.EXPIRED, latest(booking).status());
+        assertEquals(PaymentStatus.RELEASED, payments.state("auth_1"));
+        assertEquals(List.of(), payments.captures());
+        assertEquals(SeatStatus.AVAILABLE, inventory.status("A1"));
+        assertEquals(List.of("payment failed " + booking.id()), deliveredEvents());
+    }
+
+    @Test
+    void neverConfirmsAPaymentFoundAfterTheShowStartedEvenIfTheHoldIsStillLive() {
+        Instant startsSoon = NOW.plus(Duration.ofMinutes(5));
+        shows.add(Fixtures.show("soon", startsSoon));
+        Booking booking = service.holdSeats(alice, "soon", List.of("A1"));
+        payAndCloseTheTab(booking);
+        clock.set(startsSoon.plusSeconds(30));
+
+        service.reconcilePendingPayments();
+
+        assertEquals(BookingStatus.EXPIRED, latest(booking).status());
+        assertEquals(List.of(), payments.captures());
+        assertEquals(PaymentStatus.RELEASED, payments.state("auth_1"));
+    }
+
+    @Test
+    void anAbandonedHoldIsExpiredOnceAndNeverLookedUpAgain() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        clock.advance(TTL);
+
+        assertEquals(List.of(booking.id()), service.reconcilePendingPayments().expiredHoldBookingIds());
+        service.reconcilePendingPayments();
+
+        assertEquals(BookingStatus.EXPIRED, latest(booking).status());
+        assertEquals(1, payments.paidLookups());
+        assertEquals(List.of(), deliveredEvents());
+    }
+
+    @Test
+    void theBrowsersLateConfirmAfterReconciliationConfirmedReturnsTheBooking() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        CheckoutResult paid = payAndCloseTheTab(booking);
+        clock.advance(BookingService.BROWSER_CONFIRM_GRACE);
+        service.reconcilePendingPayments();
+
+        Booking confirmed = service.confirm(alice, booking.id(), paid);
+
+        assertEquals(BookingStatus.CONFIRMED, confirmed.status());
+        assertEquals(1, payments.captureAttempts());
+    }
+
+    @Test
+    void aConfirmForAHoldReconciliationAlreadyExpiredReleasesThePayment() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        clock.advance(TTL);
+        service.reconcilePendingPayments();
+        CheckoutResult paidLate = payments.simulateCheckout(booking.checkout());
+
+        assertThrows(HoldExpiredException.class, () -> service.confirm(alice, booking.id(), paidLate));
+
+        assertEquals(PaymentStatus.RELEASED, payments.state("auth_1"));
+        assertEquals(List.of(), payments.captures());
+    }
+
+    @Test
+    void anUnreachableProcessorLeavesTheHoldForTheNextRun() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        payAndCloseTheTab(booking);
+        clock.advance(BookingService.BROWSER_CONFIRM_GRACE);
+        payments.failPaidLookups(1);
+
+        ReconciliationReport failed = service.reconcilePendingPayments();
+        assertEquals(List.of(booking.id()), failed.failures().stream().map(ReconciliationReport.Failure::bookingId).toList());
+        assertEquals(BookingStatus.HELD, latest(booking).status());
+
+        service.reconcilePendingPayments();
+        assertEquals(BookingStatus.CONFIRMED, latest(booking).status());
+    }
+
+    @Test
+    void aPaymentFoundAfterItsDiscountRanOutIsReleasedOnceNotRetriedForever() {
+        DiscountCode dc = code("LAST", new Discount.Flat(5_000), 0, 1);
+        Booking unreported = service.holdSeats(alice, "sh", List.of("A1"), "LAST");
+        Booking other = service.holdSeats(bob, "sh", List.of("A2"), "LAST");
+        payAndCloseTheTab(unreported);
+        confirm(bob, other);
+        clock.advance(BookingService.BROWSER_CONFIRM_GRACE);
+
+        service.reconcilePendingPayments();
+        service.reconcilePendingPayments();
+
+        assertEquals(BookingStatus.EXPIRED, latest(unreported).status());
+        assertEquals(PaymentStatus.RELEASED, payments.state("auth_1"));
+        assertEquals(1, used(dc));
+        assertEquals(1, payments.paidLookups());
+        assertEquals(List.of("confirmed " + other.id(), "payment failed " + unreported.id()), deliveredEvents());
+    }
+
     // --- crash recovery: the process dies part-way through confirm ---
 
     @Test
@@ -745,24 +887,39 @@ abstract class BookingServiceContract {
     }
 
     @Test
-    void rejectsConfirmingTwice() {
+    void repeatingConfirmWithTheSamePaymentReturnsTheBookingWithoutCapturingAgain() {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
         confirm(alice, booking);
 
-        assertThrows(IllegalBookingStateException.class, () -> confirm(alice, booking));
-        assertEquals(1, payments.captures().size());
+        Booking again = confirm(alice, booking);
+
+        assertEquals(BookingStatus.CONFIRMED, again.status());
+        assertEquals(1, payments.captureAttempts());
     }
 
     @Test
-    void secondConfirmArrivingMidPaymentWaitsAndIsRejected() throws Exception {
+    void aSecondDifferentPaymentForAConfirmedBookingIsRejectedAndReleased() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        confirm(alice, booking);
+        CheckoutResult secondPayment = payments.simulateAnotherPayment(booking.checkout());
+
+        assertThrows(IllegalBookingStateException.class, () -> service.confirm(alice, booking.id(), secondPayment));
+
+        assertEquals(PaymentStatus.RELEASED, payments.state(secondPayment.paymentId()));
+        assertEquals(1, payments.captures().size());
+        assertEquals(BookingStatus.CONFIRMED, latest(booking).status());
+    }
+
+    @Test
+    void secondConfirmArrivingMidPaymentWaitsAndThenReturnsTheConfirmedBooking() throws Exception {
         Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
         // Paid up front: the fake's simulateCheckout is synchronized, so calling it from the second thread would
         // park that thread inside the fake rather than on the booking lock this test is about.
         CheckoutResult paid = payments.simulateCheckout(booking.checkout());
-        AtomicReference<Throwable> secondOutcome = new AtomicReference<>();
+        AtomicReference<Object> secondOutcome = new AtomicReference<>();
         Thread second = new Thread(() -> {
             try {
-                service.confirm(alice, booking.id(), paid);
+                secondOutcome.set(service.confirm(alice, booking.id(), paid).status());
             } catch (Throwable t) {
                 secondOutcome.set(t);
             }
@@ -776,9 +933,10 @@ abstract class BookingServiceContract {
         service.confirm(alice, booking.id(), paid);
         second.join(5_000);
 
-        assertInstanceOf(IllegalBookingStateException.class, secondOutcome.get());
-        // The booking lock must stop the second confirm before it reaches the gateway at all.
-        assertEquals(1, payments.verifyAttempts());
+        // Without the booking lock the second confirm runs alongside the first, finds the booking still HELD, and
+        // trips over the transitions the first one made; with it, it waits and sees a finished CONFIRMED booking.
+        assertEquals(BookingStatus.CONFIRMED, secondOutcome.get());
+        assertEquals(1, payments.captureAttempts());
         assertEquals(1, payments.captures().size());
         assertEquals(BookingStatus.CONFIRMED, latest(booking).status());
     }

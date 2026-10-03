@@ -45,6 +45,7 @@ class ApiServerTest {
     private final FakeRazorpayServer razorpay = startRazorpay();
     private final HttpClient http = HttpClient.newHttpClient();
     private final InMemoryStorage storage = new InMemoryStorage(clock);
+    private BookingService service;
     private final ApiServer api = startApi();
 
     private FakeRazorpayServer startRazorpay() {
@@ -59,7 +60,7 @@ class ApiServerTest {
         storage.shows().add(Fixtures.show("sh", NOW.plus(Duration.ofHours(8))));
         RazorpayPaymentGateway gateway = new RazorpayPaymentGateway(http, new RazorpayPaymentGateway.Config(
                 razorpay.baseUrl(), FakeRazorpayServer.KEY_ID, FakeRazorpayServer.KEY_SECRET, "INR", Duration.ofMinutes(20), Duration.ofMillis(500)));
-        BookingService service = new BookingService(storage, gateway, new TieredRefundPolicy(List.of(new TieredRefundPolicy.Tier(Duration.ofHours(4), 5_000))),
+        service = new BookingService(storage, gateway, new TieredRefundPolicy(List.of(new TieredRefundPolicy.Tier(Duration.ofHours(4), 5_000))),
                 new BookingConfig(Duration.ofMinutes(10), 10, 0, Duration.ofMinutes(15), BookingConfig.DEFAULT_CAPTURE_RETRY), clock,
                 new NotificationOutbox(List.of(), new RetryPolicy(3, Duration.ofSeconds(30)), Duration.ofDays(1), clock));
         try {
@@ -186,6 +187,20 @@ class ApiServerTest {
         assertEquals(200, reply.status(), reply.body());
         assertEquals("CONFIRMED", reply.json().getString("status"));
         assertEquals("BOOKED", seatStatus("A1"));
+        assertEquals(1, razorpay.captureCount());
+    }
+
+    @Test
+    void thePagesConfirmArrivingAfterReconciliationConfirmedTheBookingIs200() {
+        JSONObject booking = hold("alice", "A1");
+        CheckoutResult paid = razorpay.simulateCheckout(session(booking));
+        clock.advance(BookingService.BROWSER_CONFIRM_GRACE);
+        service.reconcilePendingPayments();
+
+        Reply reply = call("POST", "/api/bookings/" + booking.getString("id") + "/confirm", "alice", confirmBody(paid));
+
+        assertEquals(200, reply.status(), reply.body());
+        assertEquals("CONFIRMED", reply.json().getString("status"));
         assertEquals(1, razorpay.captureCount());
     }
 
