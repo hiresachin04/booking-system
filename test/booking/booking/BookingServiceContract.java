@@ -15,6 +15,7 @@ import booking.notify.Outbox;
 import booking.retry.RetryPolicy;
 import booking.payment.CheckoutResult;
 import booking.payment.PaymentRejectedException;
+import booking.payment.PaymentResult;
 import booking.payment.PaymentStatus;
 import booking.payment.PaymentVerificationException;
 import booking.pricing.Discount;
@@ -22,6 +23,7 @@ import booking.support.FakePaymentGateway;
 import booking.support.Fixtures;
 import booking.support.MutableClock;
 import booking.support.Race;
+import booking.support.SimulatedCrash;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -569,6 +571,82 @@ abstract class BookingServiceContract {
 
         assertEquals(BookingStatus.PAYMENT_REFUNDED, latest(booking).status());
         assertEquals(1, payments.refunds().size());
+    }
+
+    // --- crash recovery: the process dies part-way through confirm ---
+
+    @Test
+    void crashBeforeTheCaptureReachedTheProcessorIsFinishedByReconciliation() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        payments.crashDuringNextCapture(false);
+
+        assertThrows(SimulatedCrash.class, () -> confirm(alice, booking));
+
+        assertEquals(BookingStatus.PAYMENT_PENDING, latest(booking).status());
+        assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
+        assertEquals(List.of(), payments.captures());
+
+        service.reconcilePendingPayments();
+
+        assertEquals(BookingStatus.CONFIRMED, latest(booking).status());
+        assertEquals(1, payments.captures().size());
+        assertEquals(List.of("confirmed " + booking.id()), deliveredEvents());
+    }
+
+    @Test
+    void crashAfterTheProcessorCapturedIsConfirmedWithoutCapturingAgain() {
+        Booking booking = service.holdSeats(alice, "sh", List.of("A1"));
+        payments.crashDuringNextCapture(true);
+
+        assertThrows(SimulatedCrash.class, () -> confirm(alice, booking));
+        assertEquals(BookingStatus.PAYMENT_PENDING, latest(booking).status());
+
+        service.reconcilePendingPayments();
+
+        assertEquals(BookingStatus.CONFIRMED, latest(booking).status());
+        assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
+        assertEquals(1, payments.captures().size());
+        assertEquals(1, payments.captureAttempts(), "reconciliation read CAPTURED and must not call capture again");
+    }
+
+    /** What a confirm leaves behind if it dies right after its checkpoint, before booking any seats. */
+    private Booking checkpointedButSeatsNotBooked(Booking held) {
+        CheckoutResult paid = payments.simulateCheckout(held.checkout());
+        String authorization = ((PaymentResult.Approved) payments.verifyCheckout(held.checkout(), paid)).authorizationId();
+        Booking stored = latest(held);
+        stored.markPaymentPending(authorization, clock.instant());
+        bookings.update(stored);
+        return stored;
+    }
+
+    @Test
+    void crashBeforeTheSeatsWereBookedIsFinishedWhileTheHoldIsStillLive() {
+        Booking booking = checkpointedButSeatsNotBooked(service.holdSeats(alice, "sh", List.of("A1")));
+
+        service.reconcilePendingPayments();
+
+        assertEquals(BookingStatus.CONFIRMED, latest(booking).status());
+        assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
+        assertEquals(1, payments.captures().size());
+    }
+
+    @Test
+    void crashBeforeTheSeatsWereBookedNeverCapturesOnceTheHoldWentToSomeoneElse() {
+        Booking booking = checkpointedButSeatsNotBooked(service.holdSeats(alice, "sh", List.of("A1")));
+        clock.advance(TTL);
+        Booking bobs = service.holdSeats(bob, "sh", List.of("A1"));
+
+        service.reconcilePendingPayments();
+
+        assertEquals(BookingStatus.PAYMENT_UNRESOLVED, latest(booking).status());
+        assertEquals(List.of(), payments.captures());
+        assertEquals(SeatStatus.HELD, inventory.status("A1"));
+
+        service.reconcilePendingPayments();
+        assertEquals(BookingStatus.PAYMENT_FAILED, latest(booking).status());
+        assertEquals(PaymentStatus.RELEASED, payments.state("auth_1"));
+        confirm(bob, bobs);
+        assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
     }
 
     @Test

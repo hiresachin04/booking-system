@@ -142,6 +142,40 @@ abstract class SeatInventoryContract {
     }
 
     @Test
+    void repeatingAConfirmForSeatsThisBookingAlreadyBookedIsANoOp() {
+        inventory.hold("b1", List.of("A1", "A2"), expiry());
+        inventory.confirm("b1", List.of("A1", "A2"));
+        clock.advance(TTL.multipliedBy(2));
+
+        inventory.confirm("b1", List.of("A1", "A2"));
+
+        assertEquals(SeatStatus.BOOKED, inventory.status("A1"));
+        assertEquals(SeatStatus.BOOKED, inventory.status("A2"));
+    }
+
+    @Test
+    void confirmStillRejectsSeatsAnotherBookingBooked() {
+        inventory.hold("b1", List.of("A1"), expiry());
+        inventory.confirm("b1", List.of("A1"));
+
+        assertThrows(HoldExpiredException.class, () -> inventory.confirm("b2", List.of("A1")));
+    }
+
+    @Test
+    void releaseAllFreesThisBookingsHeldAndBookedSeatsButNoOneElses() {
+        inventory.hold("b1", List.of("A1"), expiry());
+        inventory.confirm("b1", List.of("A1"));
+        inventory.hold("b1", List.of("A2"), expiry());
+        inventory.hold("b2", List.of("A3"), expiry());
+
+        inventory.releaseAll("b1", List.of("A1", "A2", "A3"));
+
+        assertEquals(SeatStatus.AVAILABLE, inventory.status("A1"));
+        assertEquals(SeatStatus.AVAILABLE, inventory.status("A2"));
+        assertEquals(SeatStatus.HELD, inventory.status("A3"));
+    }
+
+    @Test
     void rejectsUnknownSeat() {
         assertThrows(IllegalArgumentException.class, () -> inventory.hold("b1", List.of("Z9"), expiry()));
     }

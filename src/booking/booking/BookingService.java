@@ -131,6 +131,12 @@ public final class BookingService {
                 throw e;
             }
 
+            // Checkpoint before anything irreversible: saved as PAYMENT_PENDING with capture due now, a crash at any point
+            // from here leaves a booking reconciliation finishes (book the seats, then capture; or release them),
+            // never a HELD booking whose seats are BOOKED or whose payment was taken.
+            booking.markPaymentPending(authorizationId, clock.instant());
+            bookings.update(booking);
+
             // Verification ran outside the show lock, so the hold may have lapsed and the seats gone to someone else.
             // Only funds were reserved, so losing the seats costs the customer nothing.
             try {
@@ -148,7 +154,6 @@ public final class BookingService {
                 payments.capture(authorizationId, booking.price().totalPaise());
             } catch (RuntimeException captureFailure) {
                 Instant failedAt = clock.instant();
-                booking.markPaymentPending(authorizationId, failedAt);
                 booking.recordFailedCapture(failedAt, captureFailure instanceof PaymentRejectedException, config.captureRetry());
                 try {
                     advancePayment(booking, inventory);
@@ -290,6 +295,12 @@ public final class BookingService {
         if (status == PaymentStatus.AUTHORIZED) {
             if (holdsSeats) {
                 if (!booking.isCaptureDue(clock.instant())) return Progress.WAITING;
+                if (!secureSeats(booking, inventory)) {
+                    // The confirm that checkpointed this died before booking the seats, and the hold has since run out:
+                    // the seats may be someone else's now, so this payment must never be captured.
+                    booking.markPaymentUnresolved();
+                    return Progress.WAITING;
+                }
                 status = retryCapture(booking, authorizationId);
                 if (status == PaymentStatus.AUTHORIZED) return Progress.WAITING;
             } else {
@@ -311,13 +322,23 @@ public final class BookingService {
                 }
             }
             case RELEASED -> {
-                if (holdsSeats) inventory.cancel(booking.id(), booking.seatIds());
+                if (holdsSeats) inventory.releaseAll(booking.id(), booking.seatIds());
                 booking.discountCode().ifPresent(discounts::releaseUse);
                 booking.markPaymentFailed();
             }
             case AUTHORIZED -> throw new IllegalStateException("unreachable: authorized payments are handled above");
         }
         return Progress.SETTLED;
+    }
+
+    /** Books the seats if this booking doesn't own them yet; false if they could no longer be booked for it. */
+    private static boolean secureSeats(Booking booking, SeatInventory inventory) {
+        try {
+            inventory.confirm(booking.id(), booking.seatIds());
+            return true;
+        } catch (HoldExpiredException seatsLost) {
+            return false;
+        }
     }
 
     private PaymentStatus retryCapture(Booking booking, String authorizationId) {
@@ -338,7 +359,8 @@ public final class BookingService {
     private boolean releaseSeatsIfStuck(Booking booking, SeatInventory inventory) {
         if (booking.status() != BookingStatus.PAYMENT_PENDING) return false;
         if (!booking.captureGivenUp() && clock.instant().isBefore(pendingDeadline(booking))) return false;
-        inventory.cancel(booking.id(), booking.seatIds());
+        // releaseAll, not cancel: after an interrupted confirm the seats may still only be HELD.
+        inventory.releaseAll(booking.id(), booking.seatIds());
         booking.markPaymentUnresolved();
         return true;
     }

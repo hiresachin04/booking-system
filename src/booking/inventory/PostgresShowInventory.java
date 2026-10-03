@@ -74,9 +74,9 @@ public final class PostgresShowInventory implements SeatInventory {
             long now = EpochNanos.of(clock.instant());
             for (String seatId : requested) {
                 Row row = rows.get(seatId);
-                if (!(row.status().equals("HELD") && bookingId.equals(row.bookingId()) && now < row.holdExpiresAt())) {
-                    throw new HoldExpiredException(bookingId);
-                }
+                boolean liveHold = row.status().equals("HELD") && bookingId.equals(row.bookingId()) && now < row.holdExpiresAt();
+                boolean alreadyOurs = row.status().equals("BOOKED") && bookingId.equals(row.bookingId());
+                if (!liveHold && !alreadyOurs) throw new HoldExpiredException(bookingId);
             }
             set(connection, requested, "BOOKED", bookingId, null);
             return null;
@@ -110,6 +110,20 @@ public final class PostgresShowInventory implements SeatInventory {
                 }
             }
             set(connection, requested, "AVAILABLE", null, null);
+            return null;
+        });
+    }
+
+    @Override
+    public void releaseAll(String bookingId, List<String> requested) {
+        requireKnownDistinct(requested);
+        database.inTransaction(connection -> {
+            Map<String, Row> rows = lock(connection, requested);
+            List<String> ours = new ArrayList<>();
+            for (String seatId : requested) {
+                if (bookingId.equals(rows.get(seatId).bookingId())) ours.add(seatId);
+            }
+            if (!ours.isEmpty()) set(connection, ours, "AVAILABLE", null, null);
             return null;
         });
     }

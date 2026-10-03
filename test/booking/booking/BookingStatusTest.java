@@ -23,8 +23,8 @@ class BookingStatusTest {
     }
 
     @Test
-    void pendingPaymentCanBeSettledOrGiveUpItsSeats() {
-        assertEquals(EnumSet.of(BookingStatus.CONFIRMED, BookingStatus.PAYMENT_FAILED, BookingStatus.PAYMENT_UNRESOLVED),
+    void pendingPaymentCanBeSettledGiveUpItsSeatsOrLoseThemToAnExpiredHold() {
+        assertEquals(EnumSet.of(BookingStatus.CONFIRMED, BookingStatus.PAYMENT_FAILED, BookingStatus.PAYMENT_UNRESOLVED, BookingStatus.EXPIRED),
                 reachableFrom(BookingStatus.PAYMENT_PENDING));
     }
 

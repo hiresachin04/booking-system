@@ -74,9 +74,10 @@ public final class ShowInventory implements SeatInventory {
         try {
             Instant now = clock.instant();
             for (String seatId : seatIds) {
-                if (!(slots.get(seatId) instanceof Held h && h.bookingId().equals(bookingId) && now.isBefore(h.expiresAt()))) {
-                    throw new HoldExpiredException(bookingId);
-                }
+                Slot slot = slots.get(seatId);
+                boolean liveHold = slot instanceof Held h && h.bookingId().equals(bookingId) && now.isBefore(h.expiresAt());
+                boolean alreadyOurs = slot instanceof Booked b && b.bookingId().equals(bookingId);
+                if (!liveHold && !alreadyOurs) throw new HoldExpiredException(bookingId);
             }
             Slot booked = new Booked(bookingId);
             for (String seatId : seatIds) slots.put(seatId, booked);
@@ -108,6 +109,22 @@ public final class ShowInventory implements SeatInventory {
                 }
             }
             for (String seatId : seatIds) slots.put(seatId, AVAILABLE);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public void releaseAll(String bookingId, List<String> seatIds) {
+        requireKnownDistinct(seatIds);
+        lock.lock();
+        try {
+            for (String seatId : seatIds) {
+                Slot slot = slots.get(seatId);
+                boolean ours = (slot instanceof Held h && h.bookingId().equals(bookingId))
+                        || (slot instanceof Booked b && b.bookingId().equals(bookingId));
+                if (ours) slots.put(seatId, AVAILABLE);
+            }
         } finally {
             lock.unlock();
         }

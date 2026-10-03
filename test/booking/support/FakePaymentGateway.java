@@ -62,6 +62,7 @@ public final class FakePaymentGateway implements PaymentGateway {
     private RuntimeException failNextStartPayment;
     private int captureAttempts;
     private int unavailableCaptures;
+    private Boolean crashDuringNextCapture;
     private String declineNextWith;
     private RuntimeException failNextCapture;
     private RuntimeException loseNextCaptureResponse;
@@ -102,6 +103,14 @@ public final class FakePaymentGateway implements PaymentGateway {
 
     public synchronized void failNextCapture(RuntimeException failure) {
         failNextCapture = failure;
+    }
+
+    /**
+     * The next capture "kills the process" with {@link SimulatedCrash}: before the processor sees it, or, with
+     * {@code afterApplying}, after the processor has taken the money.
+     */
+    public synchronized void crashDuringNextCapture(boolean afterApplying) {
+        crashDuringNextCapture = afterApplying;
     }
 
     /** The next {@code times} captures fail without reaching the processor, like a server error. */
@@ -199,6 +208,9 @@ public final class FakePaymentGateway implements PaymentGateway {
     @Override
     public synchronized void capture(String authorizationId, long amountPaise) {
         captureAttempts++;
+        Boolean crash = crashDuringNextCapture;
+        crashDuringNextCapture = null;
+        if (Boolean.FALSE.equals(crash)) throw new SimulatedCrash("before the capture reached the processor");
         if (unavailableCaptures > 0) {
             unavailableCaptures--;
             throw new RuntimeException("processor unavailable");
@@ -220,6 +232,7 @@ public final class FakePaymentGateway implements PaymentGateway {
         }
         states.put(authorizationId, PaymentStatus.CAPTURED);
         captures.add(new Capture(authorizationId, auth.userId(), auth.amountPaise()));
+        if (Boolean.TRUE.equals(crash)) throw new SimulatedCrash("after the processor captured");
         if (loseNextCaptureResponse != null) {
             RuntimeException failure = loseNextCaptureResponse;
             loseNextCaptureResponse = null;

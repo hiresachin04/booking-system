@@ -126,10 +126,12 @@ public final class Booking {
         this.paymentId = Objects.requireNonNull(paymentId, "paymentId");
     }
 
+    /** Capture is due from {@code since}: if the caller dies before trying it, reconciliation tries it straight away. */
     synchronized void markPaymentPending(String authorizationId, Instant since) {
         transitionTo(BookingStatus.PAYMENT_PENDING);
         this.paymentId = Objects.requireNonNull(authorizationId, "authorizationId");
         this.paymentPendingSince = Objects.requireNonNull(since, "since");
+        this.nextCaptureAt = since;
     }
 
     synchronized Instant paymentPendingSince() {
