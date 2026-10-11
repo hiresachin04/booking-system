@@ -7,3 +7,5 @@ out/
 build/
 # Local credentials, e.g. Razorpay test keys; never committed.
 secrets/
+# A saved third-party web page used as reference while designing; not ours to publish.
+src/Design a Ticket Booking Site Like Ticketmaster*

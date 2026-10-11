@@ -27,12 +27,12 @@ You should see `java version "27"`. If not, install Java 27 from [oracle.com/jav
 2. Go to **Account & Settings → API Keys → Generate Key**, and download the key (the secret is shown only once).
 3. In the project folder, create the file `secrets/razorpay.env` containing your two values:
 
-   ```
-   RAZORPAY_KEY_ID=rzp_test_xxxxxxxxxxxx
-   RAZORPAY_KEY_SECRET=xxxxxxxxxxxxxxxxxxxx
-   ```
+RAZORPAY_KEY_ID=rzp_test_xxxxxxxxxxxx
+RAZORPAY_KEY_SECRET=xxxxxxxxxxxxxxxxxxxx
 
-   The key id must start with `rzp_test_`. The service refuses to start with live keys. This file is never uploaded
+Use a Razorpay test card to pay (see section 3).
+
+The key id must start with `rzp_test_`. The service refuses to start with live keys. This file is never uploaded
    anywhere and is ignored by git.
 
 **c) Optional: a database, so bookings are kept**
